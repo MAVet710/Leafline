@@ -22,7 +22,7 @@ from reportlab.pdfgen import canvas
 # APP META
 # ============================
 APP_NAME = "Leafline"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DB_PATH = "leafline_audit.db"
 
 STATE_OPTIONS = ["MA", "NY", "NJ"]
@@ -225,53 +225,112 @@ def detect_panels(text: str) -> Dict[str, bool]:
     return detected
 
 # ============================
-# EVIDENCE + FINDINGS
+# TABLE-FIRST % COLUMN PARSING
 # ============================
-@dataclass
-class Evidence:
-    page_index: Optional[int]
-    snippet: str
+def _clean_cell(x) -> str:
+    return re.sub(r"\s+", " ", ("" if x is None else str(x)).strip())
 
-@dataclass
-class Finding:
-    severity: str  # HOLD, WARN, INFO
-    rule_id: str
-    title: str
-    meaning: str
-    recommendation: str
-    evidence: Evidence
+def _to_float_pct(cell: str) -> Optional[float]:
+    if not cell:
+        return None
+    if is_nd(cell) or is_nt(cell) or is_loq(cell):
+        return None
+    s = cell.replace("%", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return None
 
-def find_first_match(per_page_text: List[str], patterns: List[str], max_snip: int = 220) -> Evidence:
-    for i, t in enumerate(per_page_text):
-        for pat in patterns:
-            m = re.search(pat, t, flags=re.IGNORECASE)
-            if m:
-                start = max(m.start() - 70, 0)
-                end = min(m.end() + 140, len(t))
-                snippet = t[start:end].strip().replace("\n", " ")
-                if len(snippet) > max_snip:
-                    snippet = snippet[:max_snip].rstrip() + "…"
-                return Evidence(page_index=i, snippet=snippet)
-    return Evidence(page_index=None, snippet="Not detected in extracted text.")
+def _find_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
+    norm = [re.sub(r"\s+", "", h).lower() for h in headers]
+    for cand in candidates:
+        c = re.sub(r"\s+", "", cand).lower()
+        for i, h in enumerate(norm):
+            if h == c:
+                return i
+    return None
 
-def overall_status(findings: List[Finding]) -> str:
-    sevs = [f.severity for f in findings]
-    if "HOLD" in sevs:
-        return "HOLD"
-    if "WARN" in sevs:
-        return "NEEDS REVIEW"
-    return "PASS"
+def extract_percent_tables_from_pdf(pdf_bytes: bytes) -> Dict[str, Dict[str, float]]:
+    results: Dict[str, Dict[str, float]] = {}
+
+    table_settings = {
+        "vertical_strategy": "lines",
+        "horizontal_strategy": "lines",
+        "snap_tolerance": 3,
+        "join_tolerance": 3,
+        "edge_min_length": 3,
+        "min_words_vertical": 1,
+        "min_words_horizontal": 1,
+        "intersection_tolerance": 3,
+    }
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            try:
+                tables = page.extract_tables(table_settings=table_settings) or []
+            except Exception:
+                tables = page.extract_tables() or []
+
+            page_text = (page.extract_text() or "").lower()
+
+            for t in tables:
+                if not t or len(t) < 2:
+                    continue
+
+                headers = [_clean_cell(h) for h in t[0]]
+                if not any(headers):
+                    continue
+
+                pct_idx = _find_col_idx(headers, ["%", "percent", "pct"])
+                if pct_idx is None:
+                    continue
+
+                compound_idx = _find_col_idx(headers, ["compound", "analyte", "analytes", "name"])
+                if compound_idx is None:
+                    compound_idx = 0
+
+                section = "Analytes"
+                if "cannabinoid" in page_text or any("cannabino" in h.lower() for h in headers):
+                    section = "Cannabinoids"
+                elif "terpene" in page_text or any("terp" in h.lower() for h in headers):
+                    section = "Terpenes"
+                elif "pesticide" in page_text:
+                    section = "Pesticides"
+                elif "mycotoxin" in page_text:
+                    section = "Mycotoxins"
+                elif "metal" in page_text:
+                    section = "Heavy Metals"
+                elif "solvent" in page_text:
+                    section = "Residual Solvents"
+                elif "micro" in page_text or "yeast" in page_text or "mold" in page_text:
+                    section = "Microbials"
+
+                section_map = results.setdefault(section, {})
+
+                for row in t[1:]:
+                    if not row or len(row) <= max(compound_idx, pct_idx):
+                        continue
+
+                    compound = _clean_cell(row[compound_idx])
+                    pct_cell = _clean_cell(row[pct_idx])
+
+                    if not compound:
+                        continue
+
+                    val = _to_float_pct(pct_cell)
+                    if val is None:
+                        continue
+
+                    section_map[compound] = max(section_map.get(compound, 0.0), val)
+
+    return results
 
 # ============================
-# “% COLUMN” PARSING (DOMINANT/SECONDARY/MINOR)
+# FALLBACK LINE PARSER
 # ============================
 PCT_VALUE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 def parse_pct_from_line(line: str) -> Optional[float]:
-    """
-    Pull % value from a line, but ignore ND/NT/<LOQ rows.
-    We ONLY want the number under the % column conceptually.
-    """
     if is_nd(line) or is_nt(line) or is_loq(line):
         return None
     m = PCT_VALUE_RE.search(line)
@@ -283,10 +342,6 @@ def parse_pct_from_line(line: str) -> Optional[float]:
         return None
 
 def parse_compounds_by_percent(per_page_text: List[str], aliases: Dict[str, List[str]]) -> Dict[str, float]:
-    """
-    Scan text for compound names and capture the % value on the same line.
-    Keeps max observed % per compound.
-    """
     out: Dict[str, float] = {}
     for page in per_page_text:
         for raw_line in page.splitlines():
@@ -327,12 +382,12 @@ def bucket_terpenes(ranked: List[Tuple[str, float]]) -> Dict[str, List[Tuple[str
     return buckets
 
 # ============================
-# ALIASES
+# ALIASES (fallback only)
 # ============================
 CANNABINOID_ALIASES: Dict[str, List[str]] = {
     "THCa": [r"\bTHCA\b", r"\bTHC-A\b"],
-    "Δ9-THC": [r"Δ\s*9\s*-\s*THC", r"Delta\s*9\s*THC", r"\bD9\s*THC\b", r"\bΔ9THC\b"],
-    "Δ8-THC": [r"Δ\s*8\s*-\s*THC", r"Delta\s*8\s*THC", r"\bD8\s*THC\b", r"\bΔ8THC\b"],
+    "Δ9-THC": [r"Δ\s*9\s*-\s*THC", r"Delta\s*9\s*THC", r"\bD9\s*THC\b", r"\bΔ9THC\b", r"\bd9-THC\b"],
+    "Δ8-THC": [r"Δ\s*8\s*-\s*THC", r"Delta\s*8\s*THC", r"\bD8\s*THC\b", r"\bΔ8THC\b", r"\bd8-THC\b"],
     "THCV": [r"\bTHCV\b"],
     "CBDa": [r"\bCBDA\b", r"\bCBD-A\b"],
     "CBD": [r"\bCBD\b"],
@@ -355,8 +410,43 @@ TERPENE_ALIASES: Dict[str, List[str]] = {
 }
 
 # ============================
-# PANEL “CLEAN” NOTES (ND is good)
+# EVIDENCE + FINDINGS
 # ============================
+@dataclass
+class Evidence:
+    page_index: Optional[int]
+    snippet: str
+
+@dataclass
+class Finding:
+    severity: str  # HOLD, WARN, INFO
+    rule_id: str
+    title: str
+    meaning: str
+    recommendation: str
+    evidence: Evidence
+
+def find_first_match(per_page_text: List[str], patterns: List[str], max_snip: int = 220) -> Evidence:
+    for i, t in enumerate(per_page_text):
+        for pat in patterns:
+            m = re.search(pat, t, flags=re.IGNORECASE)
+            if m:
+                start = max(m.start() - 70, 0)
+                end = min(m.end() + 140, len(t))
+                snippet = t[start:end].strip().replace("\n", " ")
+                if len(snippet) > max_snip:
+                    snippet = snippet[:max_snip].rstrip() + "…"
+                return Evidence(page_index=i, snippet=snippet)
+    return Evidence(page_index=None, snippet="Not detected in extracted text.")
+
+def overall_status(findings: List[Finding]) -> str:
+    sevs = [f.severity for f in findings]
+    if "HOLD" in sevs:
+        return "HOLD"
+    if "WARN" in sevs:
+        return "NEEDS REVIEW"
+    return "PASS"
+
 CONTAMINANT_PANELS = {"Pesticides", "Mycotoxins", "Microbials", "Heavy Metals", "Residual Solvents"}
 
 def panel_has_nd(per_page_text: List[str], panel: str) -> bool:
@@ -366,9 +456,6 @@ def panel_has_nd(per_page_text: List[str], panel: str) -> bool:
             return True
     return False
 
-# ============================
-# FINDING ENGINE
-# ============================
 def build_findings(
     *,
     state: str,
@@ -417,7 +504,6 @@ def build_findings(
             evidence=ev_iso
         ))
 
-    # Freshness
     completed_raw = fields.get("completed_date", "")
     completed_dt = safe_parse_date(completed_raw) if completed_raw else None
     if freshness_days > 0:
@@ -442,7 +528,6 @@ def build_findings(
                 evidence=Evidence(page_index=None, snippet="No completed/released date reliably extracted.")
             ))
 
-    # Δ8 + Δ9 check (oil products)
     if product_type in OIL_PRODUCT_TYPES:
         d8 = cannabinoids_pct.get("Δ8-THC")
         d9 = cannabinoids_pct.get("Δ9-THC")
@@ -469,7 +554,7 @@ def build_findings(
     return findings
 
 # ============================
-# PDF EXPORT (CLEAN + READABLE)
+# PDF EXPORT (READABLE)
 # ============================
 def wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, size=10, leading=12) -> float:
     c.setFont("Helvetica", size)
@@ -583,7 +668,7 @@ def generate_pdf_report(
     y -= 10
 
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, "Panels (Required/Optional) — Detected in text")
+    c.drawString(x, y, "Panels — Detected in text")
     y -= 14
     c.setFont("Helvetica", 10)
 
@@ -639,21 +724,11 @@ def generate_pdf_report(
                 y = wrap_text(c, f"Evidence (page {pg}): {fnd.evidence.snippet}", x, y, max_w, size=9, leading=11)
                 y -= 8
 
-    c.showPage()
-    y = height - margin
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x, y, "Glossary")
-    y -= 18
-    c.setFont("Helvetica", 10)
-    y = wrap_text(c, "ND (Not Detected): below the lab’s detection limit (generally favorable for contaminants).", x, y, max_w)
-    y = wrap_text(c, "<LOQ: detected but too low to reliably quantify (informational).", x, y, max_w)
-    y = wrap_text(c, "NT (Not Tested): not tested / not analyzed (different from ND).", x, y, max_w)
-
     c.save()
     return buf.getvalue()
 
 # ============================
-# STREAMLIT UI (FRIENDLIER)
+# STREAMLIT UI
 # ============================
 st.set_page_config(page_title="Leafline — COA Analyzer", layout="wide")
 init_db()
@@ -691,9 +766,8 @@ with st.spinner("Reading document..."):
     if is_pdf:
         extracted_text, per_page_text = extract_text_from_pdf(file_bytes)
         parsing_method = "PDF text extraction"
-        # If text is thin, OCR first page only as a light fallback (keeps dependencies simple)
+
         if len(re.sub(r"\s+", "", extracted_text)) < 400:
-            # try OCR by rasterizing the PDF page via pdfplumber image (limited but helps some docs)
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                     page0 = pdf.pages[0]
@@ -736,13 +810,25 @@ db_insert_event(record_id, "INGESTED", {
 fields = extract_fields(extracted_text)
 panels_detected = detect_panels(extracted_text)
 
-# Parse % results (the thing you pointed to)
-cannabinoids_pct = parse_compounds_by_percent(per_page_text, CANNABINOID_ALIASES)
-terpenes_pct = parse_compounds_by_percent(per_page_text, TERPENE_ALIASES)
+# ---- TABLE-FIRST extraction (preferred) ----
+table_sections = {}
+if is_pdf:
+    try:
+        table_sections = extract_percent_tables_from_pdf(file_bytes)
+    except Exception:
+        table_sections = {}
+
+cannabinoids_pct = table_sections.get("Cannabinoids", {})
+terpenes_pct = table_sections.get("Terpenes", {})
+
+# ---- FALLBACK to line scan only if tables came up empty ----
+if not cannabinoids_pct:
+    cannabinoids_pct = parse_compounds_by_percent(per_page_text, CANNABINOID_ALIASES)
+if not terpenes_pct:
+    terpenes_pct = parse_compounds_by_percent(per_page_text, TERPENE_ALIASES)
 
 can_ranked = rank_profile(cannabinoids_pct)
 terp_ranked = rank_profile(terpenes_pct)
-
 can_buckets = bucket_cannabinoids(can_ranked)
 terp_buckets = bucket_terpenes(terp_ranked)
 
@@ -763,7 +849,6 @@ holds = [f for f in findings if f.severity == "HOLD"]
 warns = [f for f in findings if f.severity == "WARN"]
 infos = [f for f in findings if f.severity == "INFO"]
 
-# Clean panel notes
 clean_panels = []
 for p in sorted(CONTAMINANT_PANELS):
     if panels_detected.get(p, False) and panel_has_nd(per_page_text, p):
@@ -781,9 +866,6 @@ top5.write(f"**Record ID:** `{record_id}`\n\n**File SHA-256:** `{source_sha[:16]
 
 st.divider()
 
-# ============================
-# TABS: Summary / Findings / Evidence / Export
-# ============================
 tab_summary, tab_findings, tab_evidence, tab_export = st.tabs(["Summary", "Findings", "Evidence", "Export"])
 
 with tab_summary:
@@ -805,10 +887,9 @@ with tab_summary:
         render_bucket("Minor", can_buckets.get("Minor", []))
 
         st.markdown("### Terpenes")
-        if panels_detected.get("Terpenes", False) or state in ("MA", "NJ", "NY"):
-            render_bucket("Dominant", terp_buckets.get("Dominant", []))
-            render_bucket("Secondary", terp_buckets.get("Secondary", []))
-            render_bucket("Minor", terp_buckets.get("Minor", []))
+        render_bucket("Dominant", terp_buckets.get("Dominant", []))
+        render_bucket("Secondary", terp_buckets.get("Secondary", []))
+        render_bucket("Minor", terp_buckets.get("Minor", []))
 
     with right:
         st.subheader("Key Details")
@@ -835,7 +916,7 @@ with tab_summary:
         if clean_panels:
             st.success("ND/Not Detected language found for: " + ", ".join(clean_panels))
         else:
-            st.info("No ND/Not Detected panel note detected (this does not automatically mean failure).")
+            st.info("No ND/Not Detected panel note detected (does not automatically mean failure).")
 
         st.write("")
         st.subheader("Panel Checklist")
@@ -867,7 +948,7 @@ with tab_findings:
 
 with tab_evidence:
     st.subheader("Evidence Snippets (what Leafline matched)")
-    st.caption("This view is intentionally simple and stable: page references + exact extracted snippets.")
+    st.caption("Stable view: page references + extracted snippets.")
     if not findings:
         st.write("No evidence to show.")
     else:
@@ -881,7 +962,7 @@ with tab_evidence:
 
 with tab_export:
     st.subheader("Export")
-    st.write("Review the Summary + Findings tabs. When ready, export a clean report.")
+    st.write("Review Summary + Findings. When ready, export a clean report.")
 
     if st.button("Generate PDF report", type="primary"):
         pdf_bytes = generate_pdf_report(
