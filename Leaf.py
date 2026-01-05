@@ -1,148 +1,63 @@
 import io
 import re
-import uuid
 import json
+import uuid
+import zipfile
 import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, date, timezone
-from typing import Dict, List, Tuple, Optional
+from typing import List, Dict, Optional, Tuple, Any
 
 import streamlit as st
+import pandas as pd
 import pdfplumber
-from PIL import Image
-import pytesseract
 from dateutil import parser as dateparser
 
+# OCR fallback stack (no poppler needed)
+from PIL import Image
+import pypdfium2 as pdfium
+import pytesseract
+
+# PDF report export
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
 # ============================
-# APP META
+# Leafline — Batch COA Scanner
 # ============================
 APP_NAME = "Leafline"
-APP_VERSION = "1.3.1"
+APP_VERSION = "2.2.0"
 DB_PATH = "leafline_audit.db"
-
-STATE_OPTIONS = ["MA", "NY", "NJ"]
-PRODUCT_TYPES = ["Flower", "Pre-roll", "Concentrate", "Vape", "Edible", "Topical", "Tincture"]
-OIL_PRODUCT_TYPES = {"Concentrate", "Vape", "Tincture"}
+SUPPORTED_EXTS = (".pdf",)
 
 # ============================
-# RULE PACKS (STARTER)
+# Flag criteria (client logic)
 # ============================
-REQUIRED_PANELS: Dict[str, Dict[str, List[str]]] = {
-    "MA": {
-        "Flower": ["Cannabinoids", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals", "Moisture", "Water Activity", "Foreign Matter"],
-        "Pre-roll": ["Cannabinoids", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals", "Moisture", "Water Activity", "Foreign Matter"],
-        "Concentrate": ["Cannabinoids", "Residual Solvents", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals"],
-        "Vape": ["Cannabinoids", "Residual Solvents", "Heavy Metals", "Microbials"],
-        "Edible": ["Cannabinoids", "Microbials", "Mycotoxins", "Heavy Metals", "Pesticides"],
-        "Topical": ["Cannabinoids", "Microbials", "Heavy Metals"],
-        "Tincture": ["Cannabinoids", "Microbials", "Heavy Metals"],
-    },
-    "NY": {
-        "Flower": ["Cannabinoids", "Terpenes", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals", "Moisture", "Water Activity", "Foreign Matter"],
-        "Pre-roll": ["Cannabinoids", "Terpenes", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals", "Moisture", "Water Activity", "Foreign Matter"],
-        "Concentrate": ["Cannabinoids", "Terpenes", "Residual Solvents", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals"],
-        "Vape": ["Cannabinoids", "Terpenes", "Residual Solvents", "Heavy Metals", "Microbials"],
-        "Edible": ["Cannabinoids", "Microbials", "Mycotoxins", "Heavy Metals", "Pesticides"],
-        "Topical": ["Cannabinoids", "Microbials", "Heavy Metals"],
-        "Tincture": ["Cannabinoids", "Microbials", "Heavy Metals"],
-    },
-    "NJ": {
-        "Flower": ["Cannabinoids", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals", "Moisture", "Water Activity", "Foreign Matter"],
-        "Pre-roll": ["Cannabinoids", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals", "Moisture", "Water Activity", "Foreign Matter"],
-        "Concentrate": ["Cannabinoids", "Residual Solvents", "Microbials", "Mycotoxins", "Pesticides", "Heavy Metals"],
-        "Vape": ["Cannabinoids", "Residual Solvents", "Heavy Metals", "Microbials"],
-        "Edible": ["Cannabinoids", "Microbials", "Mycotoxins", "Heavy Metals"],
-        "Topical": ["Cannabinoids", "Microbials", "Heavy Metals"],
-        "Tincture": ["Cannabinoids", "Microbials", "Heavy Metals"],
-    },
-}
+EXPIRY_CUTOFF = date(2021, 11, 24)
+EARLY_YEAR_CUTOFF = 2020
+THC_THRESHOLD = 0.3  # percent
 
-# Terpenes: NY required; MA/NJ optional but we still report if present
-OPTIONAL_PANELS_BY_STATE = {"MA": ["Terpenes"], "NJ": ["Terpenes"], "NY": []}
+DELTA8_TERMS = [r"delta\s*[-]?\s*8", r"\bdelta8\b", r"Δ\s*8", r"\bΔ8\b", r"\bD8\b", r"\b8\s*THC\b"]
+DELTA9_TERMS = [r"delta\s*[-]?\s*9", r"\bdelta9\b", r"Δ\s*9", r"\bΔ9\b", r"\bD9\b", r"\b9\s*THC\b"]
+
+THC_CONTEXT_TERMS = [r"\bTHC\b", r"tetrahydrocannabinol", r"\bcannabinoid\b", r"\bpotency\b"]
+EXPIRY_TERMS = [r"expir\w*", r"expiration\s*date", r"\bexp\s*date\b", r"\bdated\b", r"manufactur\w*", r"\bmfg\b"]
+
+PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+RULESET_VERSION = "batch_flag_v1"
 
 # ============================
-# DETECTION KEYWORDS
+# Utilities / Audit DB
 # ============================
-PANEL_KEYWORDS = {
-    "Cannabinoids": [r"\bcannabinoid", r"\bpotency", r"Total\s+THC", r"Total\s+CBD", r"\bTHC\b", r"\bCBD\b"],
-    "Terpenes": [r"\bterpene", r"\blimonene\b", r"\bmyrcene\b", r"\bcaryophyllene\b", r"\bpinene\b", r"\blinalool\b"],
-    "Moisture": [r"\bmoisture\b"],
-    "Water Activity": [r"\bwater\s*activity\b", r"\baw\b"],
-    "Microbials": [r"\bmicrobial", r"\bE\.\s*coli\b", r"\bsalmonella\b", r"\byeast\b", r"\bmold\b"],
-    "Mycotoxins": [r"\bmycotoxin", r"\baflatoxin\b", r"\bochratoxin\b"],
-    "Pesticides": [r"\bpesticide"],
-    "Heavy Metals": [r"\bheavy\s*metals?\b", r"\blead\b", r"\barsenic\b", r"\bcadmium\b", r"\bmercury\b"],
-    "Residual Solvents": [r"\bsolvent", r"\bresidual\s*solvent", r"\bbutane\b", r"\bpropane\b", r"\bethanol\b"],
-    "Foreign Matter": [r"\bforeign\s*matter\b", r"\bvisual\s*inspection\b"],
-}
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-FIELD_PATTERNS = {
-    "lab_name": [r"Encore\s+Labs|Lab\s*Name[:\s]+(.+)"],
-    "sample_id": [r"Sample\s*(?:#|ID)[:\s]+([A-Za-z0-9\-_]+)"],
-    "batch_id": [r"Batch\s*(?:#|No\.|Number|ID)?[:\s]+([A-Za-z0-9\-_]+)", r"Lot\s*(?:#|No\.)?[:\s]+([A-Za-z0-9\-_]+)"],
-    "matrix": [r"Matrix[:\s]+(.+)", r"Sample\s*Type[:\s]+(.+)", r"Product\s*Type[:\s]+(.+)"],
-    "completed_date": [r"(?:Completed|Reported|Finalized|Date\s*Released|Released)\s*[:\s]+([0-9]{1,2}[/\-][0-9]{1,2}[/\-][0-9]{2,4})"],
-    "received_date": [r"Received\s*[:\s]+([0-9]{1,2}[/\-][0-9]{1,2}[/\-][0-9]{2,4})"],
-    "collected_date": [r"Collected\s*[:\s]+([0-9]{1,2}[/\-][0-9]{1,2}[/\-][0-9]{2,4})"],
-    "total_thc": [r"Total\s*THC[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%"],
-    "total_cbd": [r"Total\s*CBD[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%"],
-    "total_cannabinoids": [r"Total\s*Cannabinoids[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%"],
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
-    # --- License + approver extraction (text/OCR) ---
-    # Cultivator/Producer license numbers: MC or MP (+ optional dash)
-    "producer_license": [
-        r"\b(M[CP]\s*[-]?\s*\d{3,})\b",
-        r"\b(M[CP]\d{3,})\b",
-    ],
-    # Testing lab license numbers: IL (+ optional dash)
-    "lab_license": [
-        r"\b(IL\s*[-]?\s*\d{3,})\b",
-        r"\b(IL\d{3,})\b",
-    ],
-    # Approver name near signature blocks
-    "approver_name": [
-        r"\bQA\s*(?:Manager|Supervisor|Director|Reviewer)?\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
-        r"\bApproved\s*by\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
-        r"\bAuthorized\s*by\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
-        r"\bReviewed\s*by\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
-        r"\n([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\s*\n\s*QA\s*(?:Manager|Supervisor|Director)\b",
-    ],
-    # Approval timestamp near signature blocks
-    "approver_timestamp": [
-        r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
-        r"\b(\d{4}-\d{2}-\d{2})\b\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
-    ],
-}
-
-RD_QA_PATTERNS = [r"\bR&D\b", r"\bQA\b", r"\bfor\s+research\s+only\b"]
-ISO_SCOPE_PATTERNS = [r"not\s+part\s+of.*ISO\s*17025\s*Scope", r"outside\s+.*Scope\s+of\s+Accreditation"]
-
-# ============================
-# ND / NT / LOQ
-# ============================
-def normalize_token(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().upper())
-
-def is_nd(s: str) -> bool:
-    t = normalize_token(s).replace(".", "")
-    return any(x in t for x in ["ND", "NOT DETECTED", "NONDETECT", "NON-DETECT"])
-
-def is_nt(s: str) -> bool:
-    t = normalize_token(s).replace(".", "")
-    return any(x in t for x in ["NT", "NOT TESTED", "NOT ANALYZED"])
-
-def is_loq(s: str) -> bool:
-    t = normalize_token(s)
-    return "<LOQ" in t or "BELOW LOQ" in t or "LESS THAN LOQ" in t
-
-# ============================
-# AUDIT DB
-# ============================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -154,11 +69,15 @@ def init_db():
         source_filename TEXT NOT NULL,
         source_sha256 TEXT NOT NULL,
         source_size_bytes INTEGER NOT NULL,
-        state TEXT NOT NULL,
-        product_type TEXT NOT NULL,
         ruleset_version TEXT NOT NULL,
+        app_version TEXT NOT NULL,
         parsing_method TEXT NOT NULL,
-        notes TEXT
+        max_pages_scanned INTEGER NOT NULL,
+        ocr_used INTEGER NOT NULL,
+        flagged INTEGER NOT NULL,
+        reasons TEXT,
+        expiration_date TEXT,
+        earliest_date_found TEXT
     )
     """)
     cur.execute("""
@@ -173,25 +92,22 @@ def init_db():
     conn.commit()
     conn.close()
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
 def db_insert_record(row: dict):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
     INSERT INTO records (
         record_id, created_at_utc, reviewer, source_filename, source_sha256, source_size_bytes,
-        state, product_type, ruleset_version, parsing_method, notes
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ruleset_version, app_version, parsing_method, max_pages_scanned, ocr_used,
+        flagged, reasons, expiration_date, earliest_date_found
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["record_id"], row["created_at_utc"], row.get("reviewer"),
         row["source_filename"], row["source_sha256"], row["source_size_bytes"],
-        row["state"], row["product_type"], row["ruleset_version"],
-        row["parsing_method"], row.get("notes")
+        row["ruleset_version"], row["app_version"], row["parsing_method"],
+        row["max_pages_scanned"], int(row["ocr_used"]),
+        int(row["flagged"]), row.get("reasons"),
+        row.get("expiration_date"), row.get("earliest_date_found")
     ))
     conn.commit()
     conn.close()
@@ -213,397 +129,161 @@ def db_insert_event(record_id: str, event_type: str, payload: dict):
     conn.close()
 
 # ============================
-# EXTRACTION
+# Parsing helpers
 # ============================
 def safe_parse_date(s: str) -> Optional[date]:
     try:
-        d = dateparser.parse(s, dayfirst=False, yearfirst=False)
+        d = dateparser.parse(s, dayfirst=False, yearfirst=False, fuzzy=True)
         return d.date() if d else None
     except Exception:
         return None
 
-def extract_text_from_pdf(pdf_bytes: bytes) -> Tuple[str, List[str]]:
-    per_page = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages:
-            per_page.append(p.extract_text() or "")
-    return "\n\n".join(per_page), per_page
+def any_term(text: str, patterns: List[str]) -> bool:
+    if not text:
+        return False
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
 
-def ocr_image(img_bytes: bytes) -> str:
-    img = Image.open(io.BytesIO(img_bytes))
-    return pytesseract.image_to_string(img)
+def extract_all_dates(text: str) -> List[date]:
+    if not text:
+        return []
+    candidates = set()
 
-def extract_fields(text: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for field, patterns in FIELD_PATTERNS.items():
-        for pat in patterns:
-            m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
-            if m:
-                if field == "approver_timestamp" and m.groups():
-                    # store combined date+time if pattern captures both
-                    if len(m.groups()) >= 2:
-                        out[field] = f"{m.group(1).strip()} {m.group(2).strip()}"
-                    else:
-                        out[field] = m.group(1).strip()
-                else:
-                    out[field] = m.group(1).strip() if m.groups() else m.group(0).strip()
-                break
-    return out
+    for m in re.finditer(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", text):
+        candidates.add(m.group(1))
+    for m in re.finditer(r"\b(\d{4}-\d{2}-\d{2})\b", text):
+        candidates.add(m.group(1))
 
-def detect_panels(text: str) -> Dict[str, bool]:
-    detected = {}
-    for panel, pats in PANEL_KEYWORDS.items():
-        detected[panel] = any(re.search(p, text, flags=re.IGNORECASE) for p in pats)
-    return detected
+    out = []
+    for s in candidates:
+        d = safe_parse_date(s)
+        if d:
+            out.append(d)
+    return sorted(set(out))
 
-def ocr_footer_signature_region_from_pdf(pdf_bytes: bytes, max_pages: int = 4) -> str:
-    """
-    Many COAs print approver/signature at the bottom.
-    OCR only the bottom band of the first few pages for speed.
-    """
-    chunks: List[str] = []
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for p in pdf.pages[:max_pages]:
-                im = p.to_image(resolution=260).original
-                w, h = im.size
-                crop = im.crop((0, int(h * 0.72), w, h))
-                chunks.append(pytesseract.image_to_string(crop))
-    except Exception:
-        return ""
-    return "\n".join(chunks)
-
-# ============================
-# TABLE-FIRST % COLUMN PARSING
-# ============================
-def _clean_cell(x) -> str:
-    return re.sub(r"\s+", " ", ("" if x is None else str(x)).strip())
-
-def _to_float_pct(cell: str) -> Optional[float]:
-    if not cell:
+def extract_expiration_date(text: str) -> Optional[date]:
+    if not text:
         return None
-    if is_nd(cell) or is_nt(cell) or is_loq(cell):
-        return None
-    s = cell.replace("%", "").strip()
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-def _find_col_idx(headers: List[str], candidates: List[str]) -> Optional[int]:
-    norm = [re.sub(r"\s+", "", h).lower() for h in headers]
-    for cand in candidates:
-        c = re.sub(r"\s+", "", cand).lower()
-        for i, h in enumerate(norm):
-            if h == c:
-                return i
+    exp_line_patterns = [
+        r"(?:expiration\s*date|exp\s*date|expires?|expir\w*)\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?:expiration\s*date|exp\s*date|expires?|expir\w*)\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
+    ]
+    for pat in exp_line_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            d = safe_parse_date(m.group(1))
+            if d:
+                return d
     return None
 
-def extract_percent_tables_from_pdf(pdf_bytes: bytes) -> Dict[str, Dict[str, float]]:
-    results: Dict[str, Dict[str, float]] = {}
-
-    table_settings = {
-        "vertical_strategy": "lines",
-        "horizontal_strategy": "lines",
-        "snap_tolerance": 3,
-        "join_tolerance": 3,
-        "edge_min_length": 3,
-        "min_words_vertical": 1,
-        "min_words_horizontal": 1,
-        "intersection_tolerance": 3,
-    }
-
+def extract_text_pdfplumber(pdf_bytes: bytes, max_pages: int = 6) -> str:
+    per_page = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            try:
-                tables = page.extract_tables(table_settings=table_settings) or []
-            except Exception:
-                tables = page.extract_tables() or []
+        for p in pdf.pages[:max_pages]:
+            per_page.append(p.extract_text() or "")
+    return "\n\n".join(per_page).strip()
 
-            page_text = (page.extract_text() or "").lower()
+def render_pdf_pages_with_pdfium(pdf_bytes: bytes, max_pages: int = 6, scale: float = 2.2) -> List[Image.Image]:
+    images: List[Image.Image] = []
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    n = min(len(pdf), max_pages)
+    for i in range(n):
+        page = pdf[i]
+        pil_img = page.render(scale=scale).to_pil()
+        images.append(pil_img)
+    return images
 
-            for t in tables:
-                if not t or len(t) < 2:
-                    continue
+def ocr_images(images: List[Image.Image]) -> str:
+    out = []
+    for img in images:
+        gray = img.convert("L")
+        text = pytesseract.image_to_string(gray, config="--psm 6")
+        out.append(text)
+    return "\n\n".join(out).strip()
 
-                headers = [_clean_cell(h) for h in t[0]]
-                if not any(headers):
-                    continue
+def extract_text_hybrid(pdf_bytes: bytes, max_pages: int, min_text_len: int, ocr_scale: float) -> Tuple[str, str, bool]:
+    """
+    Returns (text, method_label, ocr_used)
+    """
+    text = extract_text_pdfplumber(pdf_bytes, max_pages=max_pages)
+    if len(text) >= min_text_len:
+        return text, "pdf_text", False
 
-                pct_idx = _find_col_idx(headers, ["%", "percent", "pct"])
-                if pct_idx is None:
-                    continue
+    # OCR fallback
+    images = render_pdf_pages_with_pdfium(pdf_bytes, max_pages=max_pages, scale=ocr_scale)
+    ocr_text = ocr_images(images)
+    combined = (text + "\n\n" + ocr_text).strip()
+    return combined, "hybrid_text+ocr", True
 
-                compound_idx = _find_col_idx(headers, ["compound", "analyte", "analytes", "name"])
-                if compound_idx is None:
-                    compound_idx = 0
+def text_has_thc_over_threshold(text: str, threshold: float) -> Tuple[bool, List[str]]:
+    evid = []
+    if not text:
+        return False, evid
 
-                section = "Analytes"
-                if "cannabinoid" in page_text or any("cannabino" in h.lower() for h in headers):
-                    section = "Cannabinoids"
-                elif "terpene" in page_text or any("terp" in h.lower() for h in headers):
-                    section = "Terpenes"
-                elif "pesticide" in page_text:
-                    section = "Pesticides"
-                elif "mycotoxin" in page_text:
-                    section = "Mycotoxins"
-                elif "metal" in page_text:
-                    section = "Heavy Metals"
-                elif "solvent" in page_text:
-                    section = "Residual Solvents"
-                elif "micro" in page_text or "yeast" in page_text or "mold" in page_text:
-                    section = "Microbials"
+    for m in re.finditer(PCT_RE, text):
+        try:
+            val = float(m.group(1))
+        except Exception:
+            continue
+        if val <= threshold:
+            continue
 
-                section_map = results.setdefault(section, {})
+        start = max(m.start() - 60, 0)
+        end = min(m.end() + 60, len(text))
+        window = text[start:end]
 
-                for row in t[1:]:
-                    if not row or len(row) <= max(compound_idx, pct_idx):
-                        continue
+        if re.search(r"\bTHC\b|tetrahydrocannabinol|Δ\s*8|Δ\s*9|delta\s*[-]?\s*[89]|\bD[89]\b", window, re.IGNORECASE):
+            snippet = re.sub(r"\s+", " ", window).strip()
+            evid.append(f"{val:.3f}% near: {snippet[:160]}")
 
-                    compound = _clean_cell(row[compound_idx])
-                    pct_cell = _clean_cell(row[pct_idx])
-
-                    if not compound:
-                        continue
-
-                    val = _to_float_pct(pct_cell)
-                    if val is None:
-                        continue
-
-                    section_map[compound] = max(section_map.get(compound, 0.0), val)
-
-    return results
-
-# ============================
-# FALLBACK LINE PARSER
-# ============================
-PCT_VALUE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
-
-def parse_pct_from_line(line: str) -> Optional[float]:
-    if is_nd(line) or is_nt(line) or is_loq(line):
-        return None
-    m = PCT_VALUE_RE.search(line)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-def parse_compounds_by_percent(per_page_text: List[str], aliases: Dict[str, List[str]]) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    for page in per_page_text:
-        for raw_line in page.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            for canonical, pats in aliases.items():
-                if any(re.search(p, line, flags=re.IGNORECASE) for p in pats):
-                    val = parse_pct_from_line(line)
-                    if val is None:
-                        continue
-                    out[canonical] = max(out.get(canonical, 0.0), val)
-    return out
-
-def rank_profile(vals: Dict[str, float]) -> List[Tuple[str, float]]:
-    return sorted(vals.items(), key=lambda kv: kv[1], reverse=True)
-
-def bucket_cannabinoids(ranked: List[Tuple[str, float]]) -> Dict[str, List[Tuple[str, float]]]:
-    buckets = {"Dominant": [], "Secondary": [], "Minor": []}
-    for name, v in ranked:
-        if v >= 10.0:
-            buckets["Dominant"].append((name, v))
-        elif v >= 1.0:
-            buckets["Secondary"].append((name, v))
-        elif v >= 0.1:
-            buckets["Minor"].append((name, v))
-    return buckets
-
-def bucket_terpenes(ranked: List[Tuple[str, float]]) -> Dict[str, List[Tuple[str, float]]]:
-    buckets = {"Dominant": [], "Secondary": [], "Minor": []}
-    for name, v in ranked:
-        if v >= 0.5:
-            buckets["Dominant"].append((name, v))
-        elif v >= 0.1:
-            buckets["Secondary"].append((name, v))
-        else:
-            buckets["Minor"].append((name, v))
-    return buckets
+    return (len(evid) > 0), evid
 
 # ============================
-# ALIASES (fallback only)
+# Flag evaluation (client logic)
 # ============================
-CANNABINOID_ALIASES: Dict[str, List[str]] = {
-    "THCa": [r"\bTHCA\b", r"\bTHC-A\b"],
-    "Δ9-THC": [r"Δ\s*9\s*-\s*THC", r"Delta\s*9\s*THC", r"\bD9\s*THC\b", r"\bΔ9THC\b", r"\bd9-THC\b"],
-    "Δ8-THC": [r"Δ\s*8\s*-\s*THC", r"Delta\s*8\s*THC", r"\bD8\s*THC\b", r"\bΔ8THC\b", r"\bd8-THC\b"],
-    "THCV": [r"\bTHCV\b"],
-    "CBDa": [r"\bCBDA\b", r"\bCBD-A\b"],
-    "CBD": [r"\bCBD\b"],
-    "CBG": [r"\bCBG\b"],
-    "CBC": [r"\bCBC\b"],
-    "CBN": [r"\bCBN\b"],
-}
+def evaluate_flag(text: str) -> Tuple[bool, Dict[str, Any]]:
+    reasons: List[str] = []
 
-TERPENE_ALIASES: Dict[str, List[str]] = {
-    "Myrcene": [r"\bmyrcene\b"],
-    "Limonene": [r"\blimonene\b"],
-    "Caryophyllene": [r"\bcaryophyllene\b"],
-    "Humulene": [r"\bhumulene\b"],
-    "Pinene": [r"\bpinene\b"],
-    "Linalool": [r"\blinalool\b"],
-    "Terpinolene": [r"\bterpinolene\b"],
-    "Ocimene": [r"\bocimene\b"],
-    "Bisabolol": [r"\bbisabolol\b"],
-    "Farnesene": [r"\bfarnesene\b"],
-}
+    has_delta = any_term(text, DELTA8_TERMS) or any_term(text, DELTA9_TERMS)
+    has_thc_context = any_term(text, THC_CONTEXT_TERMS)
+    has_exp_terms = any_term(text, EXPIRY_TERMS)
 
-# ============================
-# EVIDENCE + FINDINGS
-# ============================
-@dataclass
-class Evidence:
-    page_index: Optional[int]
-    snippet: str
+    exp_date = extract_expiration_date(text)
+    all_dates = extract_all_dates(text)
+    early_dates = [d for d in all_dates if d.year <= EARLY_YEAR_CUTOFF]
 
-@dataclass
-class Finding:
-    severity: str  # HOLD, WARN, INFO
-    rule_id: str
-    title: str
-    meaning: str
-    recommendation: str
-    evidence: Evidence
+    thc_over, thc_evidence = text_has_thc_over_threshold(text, THC_THRESHOLD)
 
-def find_first_match(per_page_text: List[str], patterns: List[str], max_snip: int = 220) -> Evidence:
-    for i, t in enumerate(per_page_text):
-        for pat in patterns:
-            m = re.search(pat, t, flags=re.IGNORECASE)
-            if m:
-                start = max(m.start() - 70, 0)
-                end = min(m.end() + 140, len(t))
-                snippet = t[start:end].strip().replace("\n", " ")
-                if len(snippet) > max_snip:
-                    snippet = snippet[:max_snip].rstrip() + "…"
-                return Evidence(page_index=i, snippet=snippet)
-    return Evidence(page_index=None, snippet="Not detected in extracted text.")
+    if has_delta:
+        reasons.append("Δ8/Δ9 term detected")
+    if has_thc_context:
+        reasons.append("THC/cannabinoid context detected")
+    if has_exp_terms:
+        reasons.append("Expiration/dated/manufacture language detected")
 
-def overall_status(findings: List[Finding]) -> str:
-    sevs = [f.severity for f in findings]
-    if "HOLD" in sevs:
-        return "HOLD"
-    if "WARN" in sevs:
-        return "NEEDS REVIEW"
-    return "PASS"
+    if thc_over:
+        reasons.append(f"THC-related % exceeds {THC_THRESHOLD}%")
+    else:
+        reasons.append(f"No THC % > {THC_THRESHOLD}% found near THC terms")
 
-CONTAMINANT_PANELS = {"Pesticides", "Mycotoxins", "Microbials", "Heavy Metals", "Residual Solvents"}
+    if exp_date and exp_date < EXPIRY_CUTOFF:
+        reasons.append(f"Expiration date before {EXPIRY_CUTOFF.isoformat()} ({exp_date.isoformat()})")
+    if early_dates:
+        reasons.append(f"Contains date(s) in {EARLY_YEAR_CUTOFF} or earlier (e.g., {early_dates[0].isoformat()})")
 
-def panel_has_nd(per_page_text: List[str], panel: str) -> bool:
-    pats = PANEL_KEYWORDS.get(panel, [])
-    for t in per_page_text:
-        if any(re.search(p, t, re.I) for p in pats) and re.search(r"\bND\b|Not\s+Detected|Non-Detect|Non\s*Detect", t, re.I):
-            return True
-    return False
+    # Main boolean rule:
+    flagged = bool(has_delta and has_thc_context and has_exp_terms and thc_over)
 
-def build_findings(
-    *,
-    state: str,
-    product_type: str,
-    fields: Dict[str, str],
-    panels_detected: Dict[str, bool],
-    per_page_text: List[str],
-    freshness_days: int,
-    d8_high_threshold_pct: float,
-    d9_present_threshold_pct: float,
-    cannabinoids_pct: Dict[str, float],
-) -> List[Finding]:
-    findings: List[Finding] = []
-    required = REQUIRED_PANELS.get(state, {}).get(product_type, [])
-    missing = [p for p in required if not panels_detected.get(p, False)]
-
-    for i, p in enumerate(missing, start=1):
-        findings.append(Finding(
-            severity="HOLD",
-            rule_id=f"{state}-REQ-{i:03d}",
-            title=f"Required panel missing: {p}",
-            meaning="This panel was not detected in the extracted COA text. It may be missing or labeled differently.",
-            recommendation="Request a complete COA that clearly includes this panel and its results.",
-            evidence=Evidence(page_index=None, snippet=f"Panel '{p}' not detected in extracted text.")
-        ))
-
-    ev_rd = find_first_match(per_page_text, RD_QA_PATTERNS)
-    if ev_rd.page_index is not None:
-        findings.append(Finding(
-            severity="WARN",
-            rule_id=f"{state}-DOC-001",
-            title="R&D / QA language detected",
-            meaning="Some COAs contain R&D/QA wording that can change how the document is interpreted.",
-            recommendation="Confirm whether a compliance-format COA is required.",
-            evidence=ev_rd
-        ))
-
-    ev_iso = find_first_match(per_page_text, ISO_SCOPE_PATTERNS)
-    if ev_iso.page_index is not None:
-        findings.append(Finding(
-            severity="WARN",
-            rule_id=f"{state}-ACC-001",
-            title="Scope/accreditation limitation language detected",
-            meaning="The COA may indicate some testing is outside the lab’s accreditation scope.",
-            recommendation="Confirm which analytes are covered under accreditation for your use case.",
-            evidence=ev_iso
-        ))
-
-    completed_raw = fields.get("completed_date", "")
-    completed_dt = safe_parse_date(completed_raw) if completed_raw else None
-    if freshness_days > 0:
-        if completed_raw and completed_dt:
-            age = (date.today() - completed_dt).days
-            if age > freshness_days:
-                findings.append(Finding(
-                    severity="WARN",
-                    rule_id=f"{state}-DATE-001",
-                    title="COA may be older than the configured threshold",
-                    meaning="Older COAs may not represent the current lot or may be less reliable for time-sensitive claims.",
-                    recommendation="Request a more recent COA or document why this one is acceptable.",
-                    evidence=Evidence(page_index=None, snippet=f"Completed/Released: {completed_raw} (~{age} days old). Threshold: {freshness_days} days.")
-                ))
-        else:
-            findings.append(Finding(
-                severity="INFO",
-                rule_id=f"{state}-DATE-INFO",
-                title="Completed/Released date not confidently extracted",
-                meaning="The date may exist on the COA, but it wasn’t reliably detected in extracted text.",
-                recommendation="Verify the completed/released date manually.",
-                evidence=Evidence(page_index=None, snippet="No completed/released date reliably extracted.")
-            ))
-
-    if product_type in OIL_PRODUCT_TYPES:
-        d8 = cannabinoids_pct.get("Δ8-THC")
-        d9 = cannabinoids_pct.get("Δ9-THC")
-        if d8 is not None and d9 is not None:
-            if d9 >= d9_present_threshold_pct and d8 >= d8_high_threshold_pct:
-                findings.append(Finding(
-                    severity="WARN",
-                    rule_id=f"{state}-D8D9-001",
-                    title="Oil product: elevated Δ8-THC while Δ9-THC is also present",
-                    meaning="This cannabinoid pattern may warrant review depending on product claims and stakeholder standards.",
-                    recommendation="Confirm units, formulation intent, and whether labeling/disclosure expectations are met.",
-                    evidence=Evidence(page_index=None, snippet=f"Extracted: Δ8-THC {d8:.2f}%, Δ9-THC {d9:.2f}% (thresholds: Δ8≥{d8_high_threshold_pct}%, Δ9≥{d9_present_threshold_pct}%).")
-                ))
-        else:
-            findings.append(Finding(
-                severity="INFO",
-                rule_id=f"{state}-D8D9-INFO",
-                title="Δ8/Δ9 cross-check limited",
-                meaning="Δ8-THC and/or Δ9-THC % values were not reliably extracted.",
-                recommendation="Verify Δ8 and Δ9 rows manually on the COA cannabinoid table.",
-                evidence=Evidence(page_index=None, snippet="Δ8-THC and/or Δ9-THC not reliably extracted.")
-            ))
-
-    return findings
+    details = {
+        "expiration_date": exp_date.isoformat() if exp_date else "",
+        "earliest_date_found": (
+            early_dates[0].isoformat() if early_dates else (all_dates[0].isoformat() if all_dates else "")
+        ),
+        "thc_evidence": thc_evidence,
+    }
+    return flagged, {"reasons": reasons, "details": details}
 
 # ============================
-# PDF EXPORT (READABLE)
+# PDF batch report generator
 # ============================
 def wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, size=10, leading=12) -> float:
     c.setFont("Helvetica", size)
@@ -622,22 +302,7 @@ def wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float,
         y -= leading
     return y
 
-def generate_pdf_report(
-    *,
-    record_id: str,
-    state: str,
-    product_type: str,
-    ruleset_version: str,
-    reviewer: str,
-    source_filename: str,
-    source_sha256: str,
-    fields: Dict[str, str],
-    panels_detected: Dict[str, bool],
-    clean_panels: List[str],
-    findings: List[Finding],
-    can_buckets: Dict[str, List[Tuple[str, float]]],
-    terp_buckets: Dict[str, List[Tuple[str, float]]],
-) -> bytes:
+def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
     width, height = letter
@@ -646,420 +311,285 @@ def generate_pdf_report(
     y = height - margin
     max_w = width - 2 * margin
 
-    status = overall_status(findings)
-    created_utc = utc_now_iso()
+    total = len(rows)
+    flagged = sum(1 for r in rows if r.get("flagged") is True)
+    created = utc_now_iso()
 
     c.setFont("Helvetica-Bold", 18)
-    c.drawString(x, y, f"{APP_NAME} — COA Summary Report")
+    c.drawString(x, y, f"{APP_NAME} — Batch Report")
     y -= 22
 
     c.setFont("Helvetica", 10)
-    c.drawString(x, y, f"Record ID: {record_id}")
+    c.drawString(x, y, f"Generated (UTC): {created}")
     y -= 12
-    c.drawString(x, y, f"Generated (UTC): {created_utc}")
+    c.drawString(x, y, f"App: {APP_VERSION}   |   Ruleset: {RULESET_VERSION}")
     y -= 12
-    c.drawString(x, y, f"Reviewer: {reviewer or 'Not provided'}")
-    y -= 12
-    c.drawString(x, y, f"Jurisdiction: {state}   |   Product Type: {product_type}")
-    y -= 12
-    c.drawString(x, y, f"Ruleset: {ruleset_version}   |   App: {APP_VERSION}")
-    y -= 16
-
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x, y, f"Overall Result: {status}")
+    c.drawString(x, y, f"Total PDFs scanned: {total}   |   Flagged: {flagged}")
     y -= 16
 
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, "Source File Integrity")
+    c.drawString(x, y, "Flag Logic")
     y -= 14
     c.setFont("Helvetica", 10)
-    y = wrap_text(c, f"Filename: {source_filename}", x, y, max_w)
-    y = wrap_text(c, f"SHA-256: {source_sha256}", x, y, max_w)
-    y -= 6
-
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, "Key Identifiers (as extracted)")
-    y -= 14
-    c.setFont("Helvetica", 10)
-    keys = [
-        ("Lab", fields.get("lab_name", "Not detected")),
-        ("Testing Lab License (IL…)", fields.get("lab_license", "Not detected")),
-        ("Approver (QA/Reviewer)", fields.get("approver_name", "Not detected")),
-        ("Approval timestamp", fields.get("approver_timestamp", "Not detected")),
-        ("Sample ID", fields.get("sample_id", "Not detected")),
-        ("Batch/Lot", fields.get("batch_id", "Not detected")),
-        ("Producer/Cultivator License (MC/MP…)", fields.get("producer_license", "Not detected")),
-        ("Matrix / Type", fields.get("matrix", "Not detected")),
-        ("Collected", fields.get("collected_date", "Not detected")),
-        ("Received", fields.get("received_date", "Not detected")),
-        ("Completed/Released", fields.get("completed_date", "Not detected")),
-        ("Total THC", fields.get("total_thc", "Not detected")),
-        ("Total CBD", fields.get("total_cbd", "Not detected")),
-        ("Total Cannabinoids", fields.get("total_cannabinoids", "Not detected")),
-    ]
-    for k, v in keys:
-        y = wrap_text(c, f"{k}: {v}", x, y, max_w)
-    y -= 8
-
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, "Plain-English Profile")
-    y -= 14
-    c.setFont("Helvetica", 10)
-
-    def fmt_bucket(title: str, items: List[Tuple[str, float]]) -> str:
-        if not items:
-            return f"{title}: None extracted"
-        return f"{title}: " + ", ".join([f"{n} ({v:.2f}%)" for n, v in items[:6]])
-
-    y = wrap_text(c, fmt_bucket("Dominant cannabinoids", can_buckets.get("Dominant", [])), x, y, max_w)
-    y = wrap_text(c, fmt_bucket("Secondary cannabinoids", can_buckets.get("Secondary", [])), x, y, max_w)
-    y = wrap_text(c, fmt_bucket("Minor cannabinoids", can_buckets.get("Minor", [])), x, y, max_w)
-    y -= 6
-    y = wrap_text(c, fmt_bucket("Dominant terpenes", terp_buckets.get("Dominant", [])), x, y, max_w)
-    y = wrap_text(c, fmt_bucket("Secondary terpenes", terp_buckets.get("Secondary", [])), x, y, max_w)
-    y = wrap_text(c, fmt_bucket("Minor terpenes", terp_buckets.get("Minor", [])), x, y, max_w)
+    y = wrap_text(
+        c,
+        "Flag if: (Δ8 or Δ9) AND (THC/cannabinoid context) AND (expiration/dated/manufacture language) AND (THC-related % > 0.3%).",
+        x, y, max_w
+    )
+    y = wrap_text(
+        c,
+        f"Date notes included: expiration date before {EXPIRY_CUTOFF.isoformat()} and/or any detected date in {EARLY_YEAR_CUTOFF} or earlier.",
+        x, y, max_w
+    )
     y -= 10
 
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(x, y, "Panels — Detected in text")
-    y -= 14
-    c.setFont("Helvetica", 10)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x, y, "Flagged PDFs (details)")
+    y -= 16
 
-    required = REQUIRED_PANELS.get(state, {}).get(product_type, [])
-    optional = OPTIONAL_PANELS_BY_STATE.get(state, [])
-    for p in required:
-        mark = "Yes" if panels_detected.get(p, False) else "No"
-        y = wrap_text(c, f"{p} (Required): {mark}", x, y, max_w)
-    for p in optional:
-        mark = "Yes" if panels_detected.get(p, False) else "No"
-        y = wrap_text(c, f"{p} (Optional): {mark}", x, y, max_w)
-    y -= 8
-
-    if clean_panels:
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(x, y, "Clean Panel Notes (ND/Not Detected found)")
-        y -= 14
-        c.setFont("Helvetica", 10)
-        y = wrap_text(c, "Leafline treats ND as favorable for contaminant-style panels (below detection).", x, y, max_w)
-        for p in clean_panels:
-            y = wrap_text(c, f"- {p}: ND/Not Detected language found", x, y, max_w)
-        y -= 8
-
-    c.showPage()
-    y = height - margin
-
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x, y, "Issues & Recommendations")
-    y -= 18
-
-    if not findings:
+    flagged_rows = [r for r in rows if r.get("flagged") is True]
+    if not flagged_rows:
         c.setFont("Helvetica", 11)
-        c.drawString(x, y, "No issues generated by the current rule set.")
-        y -= 14
-    else:
-        for sev in ["HOLD", "WARN", "INFO"]:
-            items = [f for f in findings if f.severity == sev]
-            if not items:
-                continue
-            c.setFont("Helvetica-Bold", 12)
-            c.drawString(x, y, f"{sev} ({len(items)})")
-            y -= 16
-            for fnd in items:
-                if y < 1.2 * inch:
-                    c.showPage()
-                    y = height - margin
-                c.setFont("Helvetica-Bold", 10)
-                y = wrap_text(c, f"{fnd.rule_id} — {fnd.title}", x, y, max_w, size=10, leading=12)
-                c.setFont("Helvetica", 10)
-                y = wrap_text(c, f"What it means: {fnd.meaning}", x, y, max_w, size=10, leading=12)
-                y = wrap_text(c, f"Recommendation: {fnd.recommendation}", x, y, max_w, size=10, leading=12)
-                pg = "N/A" if fnd.evidence.page_index is None else str(fnd.evidence.page_index + 1)
-                y = wrap_text(c, f"Evidence (page {pg}): {fnd.evidence.snippet}", x, y, max_w, size=9, leading=11)
-                y -= 8
+        c.drawString(x, y, "No PDFs matched the flag criteria.")
+        c.save()
+        return buf.getvalue()
+
+    for r in flagged_rows:
+        if y < 1.2 * inch:
+            c.showPage()
+            y = height - margin
+
+        c.setFont("Helvetica-Bold", 10)
+        y = wrap_text(c, r["filename"], x, y, max_w, size=10, leading=12)
+
+        c.setFont("Helvetica", 9)
+        y = wrap_text(c, f"SHA-256: {r.get('sha256', '')}", x, y, max_w, size=9, leading=11)
+        y = wrap_text(
+            c,
+            f"Extraction: {r.get('parsing_method', '')} (OCR used: {bool(r.get('ocr_used'))}, pages scanned: {r.get('max_pages_scanned')})",
+            x, y, max_w, size=9, leading=11
+        )
+
+        if r.get("expiration_date"):
+            y = wrap_text(c, f"Expiration date: {r['expiration_date']}", x, y, max_w, size=9, leading=11)
+        if r.get("earliest_date_found"):
+            y = wrap_text(c, f"Earliest date found: {r['earliest_date_found']}", x, y, max_w, size=9, leading=11)
+
+        if r.get("thc_evidence"):
+            y = wrap_text(c, "THC evidence:", x, y, max_w, size=9, leading=11)
+            for ev in r["thc_evidence"][:6]:
+                y = wrap_text(c, f"- {ev}", x + 12, y, max_w - 12, size=9, leading=11)
+
+        y = wrap_text(c, f"Reasons: {r.get('reasons', '')}", x, y, max_w, size=9, leading=11)
+        y -= 8
 
     c.save()
     return buf.getvalue()
 
 # ============================
-# STREAMLIT UI
+# Streamlit UI (user-friendly)
 # ============================
-st.set_page_config(page_title="Leafline — COA Analyzer", layout="wide")
+st.set_page_config(page_title=f"{APP_NAME} — Batch COA Scanner", layout="wide")
 init_db()
 
-st.title("Leafline")
-st.caption("COA analysis that reads like a summary, not a spreadsheet.")
+st.title(APP_NAME)
+st.caption("Upload a ZIP of PDFs. Leafline scans each file, flags matches, and exports a detailed batch report.")
 
 with st.sidebar:
-    st.subheader("Settings")
-    state = st.selectbox("Jurisdiction", STATE_OPTIONS, index=0)
-    product_type = st.selectbox("Product type", PRODUCT_TYPES, index=0)
-    freshness_days = st.number_input("Freshness threshold (days)", min_value=0, max_value=3650, value=365, step=30)
-
-    st.markdown("**Δ8/Δ9 check (oil types)**")
-    d8_high_threshold_pct = st.number_input("Δ8 high threshold (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
-    d9_present_threshold_pct = st.number_input("Δ9 present threshold (%)", min_value=0.0, max_value=100.0, value=0.5, step=0.1)
-
+    st.subheader("Scan settings")
+    max_pages = st.slider("Pages to scan per PDF", 1, 30, 8)
+    min_text_len = st.slider("OCR trigger threshold (characters)", 50, 800, 200)
+    ocr_scale = st.slider("OCR quality (higher = slower)", 1.5, 3.0, 2.2, 0.1)
     reviewer = st.text_input("Reviewer (optional)", value="")
+    st.markdown("---")
+    st.markdown("**Flag criteria**")
+    st.write("Δ8/Δ9 term + THC context + expiration/dated/manufacture + THC-related % > 0.3%")
+    st.write(f"Date notes: expiration < {EXPIRY_CUTOFF.isoformat()} or any date <= {EARLY_YEAR_CUTOFF}")
 
-uploaded = st.file_uploader("Upload COA (PDF, PNG, JPG)", type=["pdf", "png", "jpg", "jpeg"])
+zip_up = st.file_uploader("Upload ZIP of PDFs", type=["zip"])
+run = st.button("Run batch scan", type="primary", disabled=(zip_up is None))
 
-if not uploaded:
-    st.info("Upload a COA to generate a plain-English summary and exportable PDF.")
-    st.stop()
+if "batch_rows" not in st.session_state:
+    st.session_state["batch_rows"] = []
 
-file_bytes = uploaded.read()
-source_sha = sha256_bytes(file_bytes)
-record_id = str(uuid.uuid4())
-ruleset_version = f"{state}_v1.0_{datetime.now().strftime('%Y-%m-%d')}"
-created_at = utc_now_iso()
+if zip_up and run:
+    zbytes = zip_up.read()
+    out_rows: List[Dict[str, Any]] = []
 
-is_pdf = uploaded.name.lower().endswith(".pdf")
+    prog = st.progress(0.0)
+    status = st.empty()
 
-with st.spinner("Reading document..."):
-    if is_pdf:
-        extracted_text, per_page_text = extract_text_from_pdf(file_bytes)
-        parsing_method = "PDF text extraction"
+    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as z:
+        names = [n for n in z.namelist() if n.lower().endswith(SUPPORTED_EXTS) and not n.endswith("/")]
+        total = len(names)
 
-        # If the PDF has little/no selectable text, OCR page 1 (fallback)
-        if len(re.sub(r"\s+", "", extracted_text)) < 400:
-            try:
-                with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                    page0 = pdf.pages[0]
-                    pil = page0.to_image(resolution=200).original
-                    ocr_txt = pytesseract.image_to_string(pil)
-                if len(re.sub(r"\s+", "", ocr_txt)) > len(re.sub(r"\s+", "", extracted_text)):
-                    extracted_text = ocr_txt
-                    per_page_text = [ocr_txt]
-                    parsing_method = "OCR (PDF page 1 fallback)"
-            except Exception:
-                pass
-    else:
-        extracted_text = ocr_image(file_bytes)
-        per_page_text = [extracted_text]
-        parsing_method = "OCR (image)"
-
-db_insert_record({
-    "record_id": record_id,
-    "created_at_utc": created_at,
-    "reviewer": reviewer or None,
-    "source_filename": uploaded.name,
-    "source_sha256": source_sha,
-    "source_size_bytes": len(file_bytes),
-    "state": state,
-    "product_type": product_type,
-    "ruleset_version": ruleset_version,
-    "parsing_method": parsing_method,
-    "notes": None,
-})
-db_insert_event(record_id, "INGESTED", {
-    "filename": uploaded.name,
-    "sha256": source_sha,
-    "state": state,
-    "product_type": product_type,
-    "ruleset_version": ruleset_version,
-    "parsing_method": parsing_method,
-    "app_version": APP_VERSION,
-})
-
-# Base extraction
-fields = extract_fields(extracted_text)
-panels_detected = detect_panels(extracted_text)
-
-# Signature/license OCR helper (PDF only) — does not change UI, just improves extraction
-footer_ocr = ""
-if is_pdf:
-    footer_ocr = ocr_footer_signature_region_from_pdf(file_bytes)
-    if footer_ocr and len(footer_ocr.strip()) > 10:
-        merged_text = extracted_text + "\n\n" + footer_ocr
-        fields = extract_fields(merged_text)
-
-# ---- TABLE-FIRST extraction (preferred) ----
-table_sections = {}
-if is_pdf:
-    try:
-        table_sections = extract_percent_tables_from_pdf(file_bytes)
-    except Exception:
-        table_sections = {}
-
-cannabinoids_pct = table_sections.get("Cannabinoids", {})
-terpenes_pct = table_sections.get("Terpenes", {})
-
-# ---- FALLBACK to line scan only if tables came up empty ----
-if not cannabinoids_pct:
-    cannabinoids_pct = parse_compounds_by_percent(per_page_text, CANNABINOID_ALIASES)
-if not terpenes_pct:
-    terpenes_pct = parse_compounds_by_percent(per_page_text, TERPENE_ALIASES)
-
-can_ranked = rank_profile(cannabinoids_pct)
-terp_ranked = rank_profile(terpenes_pct)
-can_buckets = bucket_cannabinoids(can_ranked)
-terp_buckets = bucket_terpenes(terp_ranked)
-
-findings = build_findings(
-    state=state,
-    product_type=product_type,
-    fields=fields,
-    panels_detected=panels_detected,
-    per_page_text=per_page_text,
-    freshness_days=int(freshness_days),
-    d8_high_threshold_pct=float(d8_high_threshold_pct),
-    d9_present_threshold_pct=float(d9_present_threshold_pct),
-    cannabinoids_pct=cannabinoids_pct,
-)
-
-status = overall_status(findings)
-holds = [f for f in findings if f.severity == "HOLD"]
-warns = [f for f in findings if f.severity == "WARN"]
-infos = [f for f in findings if f.severity == "INFO"]
-
-clean_panels = []
-for p in sorted(CONTAMINANT_PANELS):
-    if panels_detected.get(p, False) and panel_has_nd(per_page_text, p):
-        clean_panels.append(p)
-
-# ============================
-# FRIENDLY DASHBOARD HEADER
-# ============================
-top1, top2, top3, top4, top5 = st.columns([1.2, 1, 1, 1, 2])
-top1.metric("Overall", status)
-top2.metric("HOLD", len(holds))
-top3.metric("WARN", len(warns))
-top4.metric("INFO", len(infos))
-top5.write(f"**Record ID:** `{record_id}`\n\n**File SHA-256:** `{source_sha[:16]}…`")
-
-st.divider()
-
-tab_summary, tab_findings, tab_evidence, tab_export = st.tabs(["Summary", "Findings", "Evidence", "Export"])
-
-with tab_summary:
-    left, right = st.columns([1.1, 0.9])
-
-    with left:
-        st.subheader("Plain-English Profile")
-
-        def render_bucket(title: str, items: List[Tuple[str, float]]):
-            if not items:
-                st.write(f"**{title}:** None extracted")
-                return
-            st.write(f"**{title}:**")
-            st.table([{"Compound": n, "Percent (%)": round(v, 2)} for n, v in items[:8]])
-
-        st.markdown("### Cannabinoids")
-        render_bucket("Dominant", can_buckets.get("Dominant", []))
-        render_bucket("Secondary", can_buckets.get("Secondary", []))
-        render_bucket("Minor", can_buckets.get("Minor", []))
-
-        st.markdown("### Terpenes")
-        render_bucket("Dominant", terp_buckets.get("Dominant", []))
-        render_bucket("Secondary", terp_buckets.get("Secondary", []))
-        render_bucket("Minor", terp_buckets.get("Minor", []))
-
-    with right:
-        st.subheader("Key Details")
-        st.write(f"**Jurisdiction:** {state}")
-        st.write(f"**Product type:** {product_type}")
-        st.write(f"**Parsing method:** {parsing_method}")
-        st.write("")
-        st.write("**Identifiers (as extracted):**")
-        st.json({
-            "lab": fields.get("lab_name", "Not detected"),
-            "lab_license": fields.get("lab_license", "Not detected"),
-            "approver_name": fields.get("approver_name", "Not detected"),
-            "approver_timestamp": fields.get("approver_timestamp", "Not detected"),
-            "sample_id": fields.get("sample_id", "Not detected"),
-            "batch_id": fields.get("batch_id", "Not detected"),
-            "producer_license": fields.get("producer_license", "Not detected"),
-            "matrix": fields.get("matrix", "Not detected"),
-            "collected_date": fields.get("collected_date", "Not detected"),
-            "received_date": fields.get("received_date", "Not detected"),
-            "completed_date": fields.get("completed_date", "Not detected"),
-            "total_thc": fields.get("total_thc", "Not detected"),
-            "total_cbd": fields.get("total_cbd", "Not detected"),
-            "total_cannabinoids": fields.get("total_cannabinoids", "Not detected"),
-        })
-
-        st.write("")
-        st.subheader("Clean Panels (ND is favorable)")
-        if clean_panels:
-            st.success("ND/Not Detected language found for: " + ", ".join(clean_panels))
+        if total == 0:
+            st.error("No PDFs found in the ZIP.")
         else:
-            st.info("No ND/Not Detected panel note detected (does not automatically mean failure).")
+            for i, name in enumerate(names, start=1):
+                status.write(f"Scanning {i}/{total}: {name}")
+                record_id = str(uuid.uuid4())
+                created_at = utc_now_iso()
 
-        st.write("")
-        st.subheader("Panel Checklist")
-        required = REQUIRED_PANELS.get(state, {}).get(product_type, [])
-        optional = OPTIONAL_PANELS_BY_STATE.get(state, [])
-        rows = []
-        for p in required:
-            rows.append({"Panel": p, "Rule": "Required", "Detected": "Yes" if panels_detected.get(p, False) else "No"})
-        for p in optional:
-            rows.append({"Panel": p, "Rule": "Optional", "Detected": "Yes" if panels_detected.get(p, False) else "No"})
-        st.table(rows)
+                try:
+                    pdf_bytes = z.read(name)
+                    sha = sha256_bytes(pdf_bytes)
 
-with tab_findings:
-    st.subheader("Issues & Recommendations")
-    if not findings:
-        st.success("No issues generated by the current rule set.")
+                    db_insert_event(record_id, "INGESTED", {
+                        "filename": name,
+                        "sha256": sha,
+                        "size_bytes": len(pdf_bytes),
+                        "max_pages_scanned": max_pages,
+                        "min_text_len": min_text_len,
+                        "ocr_scale": ocr_scale,
+                        "ruleset_version": RULESET_VERSION,
+                        "app_version": APP_VERSION,
+                    })
+
+                    text, method, ocr_used = extract_text_hybrid(
+                        pdf_bytes,
+                        max_pages=max_pages,
+                        min_text_len=min_text_len,
+                        ocr_scale=ocr_scale
+                    )
+
+                    flagged, payload = evaluate_flag(text)
+                    reasons_list = payload["reasons"]
+                    details = payload["details"]
+
+                    row = {
+                        "record_id": record_id,
+                        "created_at_utc": created_at,
+                        "filename": name,
+                        "sha256": sha,
+                        "size_bytes": len(pdf_bytes),
+                        "parsing_method": method,
+                        "ocr_used": ocr_used,
+                        "max_pages_scanned": max_pages,
+                        "flagged": bool(flagged),
+                        "reasons": "; ".join(reasons_list),
+                        "expiration_date": details.get("expiration_date") or "",
+                        "earliest_date_found": details.get("earliest_date_found") or "",
+                        "thc_evidence": details.get("thc_evidence") or [],
+                        "ruleset_version": RULESET_VERSION,
+                        "app_version": APP_VERSION,
+                    }
+                    out_rows.append(row)
+
+                    db_insert_record({
+                        "record_id": record_id,
+                        "created_at_utc": created_at,
+                        "reviewer": reviewer or None,
+                        "source_filename": name,
+                        "source_sha256": sha,
+                        "source_size_bytes": len(pdf_bytes),
+                        "ruleset_version": RULESET_VERSION,
+                        "app_version": APP_VERSION,
+                        "parsing_method": method,
+                        "max_pages_scanned": max_pages,
+                        "ocr_used": ocr_used,
+                        "flagged": bool(flagged),
+                        "reasons": "; ".join(reasons_list),
+                        "expiration_date": details.get("expiration_date") or None,
+                        "earliest_date_found": details.get("earliest_date_found") or None,
+                    })
+
+                    db_insert_event(record_id, "EVALUATED", {
+                        "flagged": bool(flagged),
+                        "reasons": reasons_list,
+                        "expiration_date": details.get("expiration_date"),
+                        "earliest_date_found": details.get("earliest_date_found"),
+                        "thc_evidence": details.get("thc_evidence")[:10],
+                        "parsing_method": method,
+                        "ocr_used": ocr_used,
+                    })
+
+                except Exception as e:
+                    db_insert_event(record_id, "ERROR", {
+                        "filename": name,
+                        "error": str(e),
+                    })
+                    out_rows.append({
+                        "record_id": record_id,
+                        "created_at_utc": created_at,
+                        "filename": name,
+                        "sha256": "",
+                        "size_bytes": 0,
+                        "parsing_method": "error",
+                        "ocr_used": False,
+                        "max_pages_scanned": max_pages,
+                        "flagged": False,
+                        "reasons": f"ERROR: {e}",
+                        "expiration_date": "",
+                        "earliest_date_found": "",
+                        "thc_evidence": [],
+                        "ruleset_version": RULESET_VERSION,
+                        "app_version": APP_VERSION,
+                    })
+
+                prog.progress(i / total)
+
+    st.session_state["batch_rows"] = out_rows
+
+rows = st.session_state.get("batch_rows", [])
+if rows:
+    df = pd.DataFrame([{
+        "record_id": r["record_id"],
+        "created_at_utc": r["created_at_utc"],
+        "filename": r["filename"],
+        "flagged": r["flagged"],
+        "reasons": r["reasons"],
+        "expiration_date": r["expiration_date"],
+        "earliest_date_found": r["earliest_date_found"],
+        "thc_evidence": " | ".join(r.get("thc_evidence", [])[:3]),
+        "sha256": r["sha256"],
+        "parsing_method": r["parsing_method"],
+        "ocr_used": r["ocr_used"],
+        "pages_scanned": r["max_pages_scanned"],
+        "ruleset_version": r["ruleset_version"],
+        "app_version": r["app_version"],
+    } for r in rows])
+
+    total = len(df)
+    flagged_ct = int(df["flagged"].sum())
+    err_ct = int((df["parsing_method"] == "error").sum())
+    ocr_ct = int(df["ocr_used"].sum())
+
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
+    c1.metric("Total scanned", total)
+    c2.metric("Flagged", flagged_ct)
+    c3.metric("OCR used", ocr_ct)
+    c4.metric("Errors", err_ct)
+
+    st.divider()
+
+    st.subheader("Batch results")
+    st.dataframe(df, use_container_width=True)
+
+    st.subheader("Flagged only")
+    flagged_df = df[df["flagged"] == True].copy()
+    if len(flagged_df) == 0:
+        st.info("No PDFs matched the flag criteria.")
     else:
-        for sev, items in [("HOLD", holds), ("WARN", warns), ("INFO", infos)]:
-            if not items:
-                continue
-            with st.expander(f"{sev} ({len(items)})", expanded=(sev in ("HOLD", "WARN"))):
-                for f in items:
-                    pg = "N/A" if f.evidence.page_index is None else str(f.evidence.page_index + 1)
-                    st.markdown(f"**{f.rule_id} — {f.title}**")
-                    st.write(f"**What it means:** {f.meaning}")
-                    st.write(f"**Recommendation:** {f.recommendation}")
-                    st.write(f"**Evidence (page {pg}):** {f.evidence.snippet}")
-                    st.divider()
+        st.dataframe(flagged_df, use_container_width=True)
 
-with tab_evidence:
-    st.subheader("Evidence Snippets (what Leafline matched)")
-    st.caption("Stable view: page references + extracted snippets.")
-    if not findings:
-        st.write("No evidence to show.")
-    else:
-        for f in findings:
-            pg = "N/A" if f.evidence.page_index is None else str(f.evidence.page_index + 1)
-            st.write(f"**{f.severity}** — {f.title}  (page {pg})")
-            st.code(f.evidence.snippet or "", language="text")
-
-    with st.expander("Raw extracted text (debug)", expanded=False):
-        st.text((extracted_text or "")[:25000])
-
-with tab_export:
+    st.divider()
     st.subheader("Export")
-    st.write("Review Summary + Findings. When ready, export a clean report.")
 
-    if st.button("Generate PDF report", type="primary"):
-        pdf_bytes = generate_pdf_report(
-            record_id=record_id,
-            state=state,
-            product_type=product_type,
-            ruleset_version=ruleset_version,
-            reviewer=reviewer,
-            source_filename=uploaded.name,
-            source_sha256=source_sha,
-            fields=fields,
-            panels_detected=panels_detected,
-            clean_panels=clean_panels,
-            findings=findings,
-            can_buckets=can_buckets,
-            terp_buckets=terp_buckets,
-        )
-        report_sha = sha256_bytes(pdf_bytes)
-        db_insert_event(record_id, "REPORT_GENERATED", {
-            "report_sha256": report_sha,
-            "overall_status": status,
-            "finding_count": len(findings),
-            "ruleset_version": ruleset_version,
-            "app_version": APP_VERSION,
-        })
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv_bytes,
+        file_name=f"Leafline_Batch_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.csv",
+        mime="text/csv",
+    )
 
-        st.success(f"Report generated. SHA-256: {report_sha}")
-        st.download_button(
-            "Download PDF Report",
-            data=pdf_bytes,
-            file_name=f"Leafline_Report_{state}_{product_type}_{record_id}.pdf",
-            mime="application/pdf",
-        )
+    batch_pdf = generate_batch_pdf_report(rows)
+    st.download_button(
+        "Download Batch PDF Report",
+        data=batch_pdf,
+        file_name=f"Leafline_Batch_Report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}Z.pdf",
+        mime="application/pdf",
+    )
+else:
+    st.info("Upload a ZIP of PDFs to run a batch scan.")
