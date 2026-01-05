@@ -1,11 +1,4 @@
 streamlit
-pymupdf
-pdfplumber
-pytesseract
-Pillow
-reportlab
-python-dateutil
-streamlit
 pandas
 pdfplumber
 python-dateutil
