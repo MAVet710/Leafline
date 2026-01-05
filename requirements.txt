@@ -10,3 +10,6 @@ pandas
 pdfplumber
 python-dateutil
 reportlab
+pytesseract
+pypdfium2
+Pillow
