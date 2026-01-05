@@ -22,7 +22,7 @@ from reportlab.pdfgen import canvas
 # APP META
 # ============================
 APP_NAME = "Leafline"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 DB_PATH = "leafline_audit.db"
 
 STATE_OPTIONS = ["MA", "NY", "NJ"]
@@ -92,6 +92,31 @@ FIELD_PATTERNS = {
     "total_thc": [r"Total\s*THC[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%"],
     "total_cbd": [r"Total\s*CBD[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%"],
     "total_cannabinoids": [r"Total\s*Cannabinoids[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%"],
+
+    # --- License + approver extraction (text/OCR) ---
+    # Cultivator/Producer license numbers: MC or MP (+ optional dash)
+    "producer_license": [
+        r"\b(M[CP]\s*[-]?\s*\d{3,})\b",
+        r"\b(M[CP]\d{3,})\b",
+    ],
+    # Testing lab license numbers: IL (+ optional dash)
+    "lab_license": [
+        r"\b(IL\s*[-]?\s*\d{3,})\b",
+        r"\b(IL\d{3,})\b",
+    ],
+    # Approver name near signature blocks
+    "approver_name": [
+        r"\bQA\s*(?:Manager|Supervisor|Director|Reviewer)?\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
+        r"\bApproved\s*by\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
+        r"\bAuthorized\s*by\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
+        r"\bReviewed\s*by\b\s*[:\-]?\s*([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})",
+        r"\n([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,3})\s*\n\s*QA\s*(?:Manager|Supervisor|Director)\b",
+    ],
+    # Approval timestamp near signature blocks
+    "approver_timestamp": [
+        r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
+        r"\b(\d{4}-\d{2}-\d{2})\b\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
+    ],
 }
 
 RD_QA_PATTERNS = [r"\bR&D\b", r"\bQA\b", r"\bfor\s+research\s+only\b"]
@@ -214,7 +239,14 @@ def extract_fields(text: str) -> Dict[str, str]:
         for pat in patterns:
             m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
             if m:
-                out[field] = m.group(1).strip() if m.groups() else m.group(0).strip()
+                if field == "approver_timestamp" and m.groups():
+                    # store combined date+time if pattern captures both
+                    if len(m.groups()) >= 2:
+                        out[field] = f"{m.group(1).strip()} {m.group(2).strip()}"
+                    else:
+                        out[field] = m.group(1).strip()
+                else:
+                    out[field] = m.group(1).strip() if m.groups() else m.group(0).strip()
                 break
     return out
 
@@ -223,6 +255,23 @@ def detect_panels(text: str) -> Dict[str, bool]:
     for panel, pats in PANEL_KEYWORDS.items():
         detected[panel] = any(re.search(p, text, flags=re.IGNORECASE) for p in pats)
     return detected
+
+def ocr_footer_signature_region_from_pdf(pdf_bytes: bytes, max_pages: int = 4) -> str:
+    """
+    Many COAs print approver/signature at the bottom.
+    OCR only the bottom band of the first few pages for speed.
+    """
+    chunks: List[str] = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for p in pdf.pages[:max_pages]:
+                im = p.to_image(resolution=260).original
+                w, h = im.size
+                crop = im.crop((0, int(h * 0.72), w, h))
+                chunks.append(pytesseract.image_to_string(crop))
+    except Exception:
+        return ""
+    return "\n".join(chunks)
 
 # ============================
 # TABLE-FIRST % COLUMN PARSING
@@ -634,8 +683,12 @@ def generate_pdf_report(
     c.setFont("Helvetica", 10)
     keys = [
         ("Lab", fields.get("lab_name", "Not detected")),
+        ("Testing Lab License (IL…)", fields.get("lab_license", "Not detected")),
+        ("Approver (QA/Reviewer)", fields.get("approver_name", "Not detected")),
+        ("Approval timestamp", fields.get("approver_timestamp", "Not detected")),
         ("Sample ID", fields.get("sample_id", "Not detected")),
         ("Batch/Lot", fields.get("batch_id", "Not detected")),
+        ("Producer/Cultivator License (MC/MP…)", fields.get("producer_license", "Not detected")),
         ("Matrix / Type", fields.get("matrix", "Not detected")),
         ("Collected", fields.get("collected_date", "Not detected")),
         ("Received", fields.get("received_date", "Not detected")),
@@ -767,6 +820,7 @@ with st.spinner("Reading document..."):
         extracted_text, per_page_text = extract_text_from_pdf(file_bytes)
         parsing_method = "PDF text extraction"
 
+        # If the PDF has little/no selectable text, OCR page 1 (fallback)
         if len(re.sub(r"\s+", "", extracted_text)) < 400:
             try:
                 with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -807,8 +861,17 @@ db_insert_event(record_id, "INGESTED", {
     "app_version": APP_VERSION,
 })
 
+# Base extraction
 fields = extract_fields(extracted_text)
 panels_detected = detect_panels(extracted_text)
+
+# Signature/license OCR helper (PDF only) — does not change UI, just improves extraction
+footer_ocr = ""
+if is_pdf:
+    footer_ocr = ocr_footer_signature_region_from_pdf(file_bytes)
+    if footer_ocr and len(footer_ocr.strip()) > 10:
+        merged_text = extracted_text + "\n\n" + footer_ocr
+        fields = extract_fields(merged_text)
 
 # ---- TABLE-FIRST extraction (preferred) ----
 table_sections = {}
@@ -900,8 +963,12 @@ with tab_summary:
         st.write("**Identifiers (as extracted):**")
         st.json({
             "lab": fields.get("lab_name", "Not detected"),
+            "lab_license": fields.get("lab_license", "Not detected"),
+            "approver_name": fields.get("approver_name", "Not detected"),
+            "approver_timestamp": fields.get("approver_timestamp", "Not detected"),
             "sample_id": fields.get("sample_id", "Not detected"),
             "batch_id": fields.get("batch_id", "Not detected"),
+            "producer_license": fields.get("producer_license", "Not detected"),
             "matrix": fields.get("matrix", "Not detected"),
             "collected_date": fields.get("collected_date", "Not detected"),
             "received_date": fields.get("received_date", "Not detected"),
