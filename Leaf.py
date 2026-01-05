@@ -10,7 +10,7 @@ from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 import pdfplumber
-import fitz  # PyMuPDF (use Python 3.11/3.12)
+import fitz  # PyMuPDF (best with Python 3.11/3.12)
 from PIL import Image
 import pytesseract
 from dateutil import parser as dateparser
@@ -26,11 +26,13 @@ from reportlab.pdfgen import canvas
 # ============================
 
 APP_NAME = "Leafline"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 DB_PATH = "leafline_audit.db"
 
 STATE_OPTIONS = ["MA", "NY", "NJ"]
 PRODUCT_TYPES = ["Flower", "Pre-roll", "Concentrate", "Vape", "Edible", "Topical", "Tincture"]
+
+OIL_PRODUCT_TYPES = {"Concentrate", "Vape", "Tincture"}  # expand if needed
 
 
 # ============================
@@ -104,7 +106,7 @@ FIELD_PATTERNS = {
     "moisture": [r"Moisture[:\s]+([0-9]+(?:\.[0-9]+)?)\s*%"],
     "water_activity": [r"Water\s*Activity[:\s]+([0-9]+(?:\.[0-9]+)?)\s*(?:aw)?"],
 
-    # More real-world COA identifiers (e.g., GVA Labs format)
+    # Real-world COA identifiers
     "metrc_sample_id": [r"METRC\s*Sample\s*ID[:\s]+([A-Z0-9]+)"],
     "metrc_source_package_id": [r"METRC\s*Source\s*Package\s*ID[:\s]+([A-Z0-9]+)"],
     "metrc_batch_id": [r"METRC\s*Batch\s*ID[:\s]+([A-Za-z0-9\-_]+)"],
@@ -292,13 +294,13 @@ def detect_panels(text: str) -> Dict[str, bool]:
         detected[panel] = any(re.search(p, text, flags=re.IGNORECASE) for p in pats)
     return detected
 
-def find_first_match(per_page_text: List[str], patterns: List[str], max_snip: int = 220) -> Evidence:
+def find_first_match(per_page_text: List[str], patterns: List[str], max_snip: int = 240) -> Evidence:
     for i, t in enumerate(per_page_text):
         for pat in patterns:
             m = re.search(pat, t, flags=re.IGNORECASE)
             if m:
                 start = max(m.start() - 80, 0)
-                end = min(m.end() + 120, len(t))
+                end = min(m.end() + 140, len(t))
                 snippet = t[start:end].strip().replace("\n", " ")
                 if len(snippet) > max_snip:
                     snippet = snippet[:max_snip].rstrip() + "…"
@@ -321,16 +323,105 @@ def group_findings(findings: List[Finding]) -> Dict[str, List[Finding]]:
 
 
 # ============================
+# DOMINANT CANNABINOIDS / TERPENES
+# ============================
+
+# Canonical names -> regex aliases we’ll search for in text tables
+CANNABINOID_ALIASES: Dict[str, List[str]] = {
+    "THCa": [r"\bTHCA\b", r"\bTHC-A\b"],
+    "Δ9-THC": [r"Δ\s*9\s*-\s*THC", r"Delta\s*9\s*THC", r"\bD9\s*THC\b", r"\b9\s*THC\b", r"\bΔ9THC\b"],
+    "Δ8-THC": [r"Δ\s*8\s*-\s*THC", r"Delta\s*8\s*THC", r"\bD8\s*THC\b", r"\b8\s*THC\b", r"\bΔ8THC\b"],
+    "THCV": [r"\bTHCV\b"],
+    "THCVa": [r"\bTHCVA\b", r"\bTHCV-A\b"],
+    "CBDa": [r"\bCBDA\b", r"\bCBD-A\b"],
+    "CBD": [r"\bCBD\b"],
+    "CBG": [r"\bCBG\b"],
+    "CBGa": [r"\bCBGA\b", r"\bCBG-A\b"],
+    "CBC": [r"\bCBC\b"],
+    "CBN": [r"\bCBN\b"],
+}
+
+TERPENE_ALIASES: Dict[str, List[str]] = {
+    "Myrcene": [r"\bmyrcene\b", r"\bβ-?myrcene\b"],
+    "Limonene": [r"\blimonene\b", r"\bd-?limonene\b"],
+    "Caryophyllene": [r"\bcaryophyllene\b", r"\bβ-?caryophyllene\b"],
+    "Humulene": [r"\bhumulene\b", r"\bα-?humulene\b"],
+    "Pinene": [r"\bpinene\b", r"\bα-?pinene\b", r"\bbeta-?pinene\b", r"\bβ-?pinene\b"],
+    "Linalool": [r"\blinalool\b"],
+    "Terpinolene": [r"\bterpinolene\b"],
+    "Ocimene": [r"\bocimene\b"],
+    "Bisabolol": [r"\bbisabolol\b"],
+    "Farnesene": [r"\bfarnesene\b"],
+}
+
+# Generic “analyte … value%” patterns we can reuse
+PCT_VALUE_RE = re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*%")
+MGG_VALUE_RE = re.compile(r"(?P<val>\d+(?:\.\d+)?)\s*(?:mg\/g|mgg)\b", flags=re.IGNORECASE)
+
+def _best_numeric_from_line(line: str) -> Optional[float]:
+    """
+    Prefer percent if present, otherwise mg/g, otherwise None.
+    """
+    m = PCT_VALUE_RE.search(line)
+    if m:
+        return float(m.group("val"))
+    m2 = MGG_VALUE_RE.search(line)
+    if m2:
+        return float(m2.group("val"))
+    return None
+
+def parse_compounds_from_text(
+    per_page_text: List[str],
+    aliases: Dict[str, List[str]],
+    max_hits_per_compound: int = 3,
+) -> Dict[str, float]:
+    """
+    Scan every line of extracted text, find lines containing a compound name,
+    then grab the best numeric (%, else mg/g). Keep the MAX value encountered
+    per compound (helps when the same analyte appears in summary + table).
+    """
+    results: Dict[str, float] = {}
+    seen_counts: Dict[str, int] = {k: 0 for k in aliases.keys()}
+
+    for page in per_page_text:
+        for raw_line in page.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            for canonical, pats in aliases.items():
+                if seen_counts[canonical] >= max_hits_per_compound:
+                    continue
+                if any(re.search(p, line, flags=re.IGNORECASE) for p in pats):
+                    val = _best_numeric_from_line(line)
+                    if val is None:
+                        continue
+                    prev = results.get(canonical)
+                    results[canonical] = val if prev is None else max(prev, val)
+                    seen_counts[canonical] += 1
+
+    return results
+
+def top_n(d: Dict[str, float], n: int = 3) -> List[Tuple[str, float]]:
+    return sorted(d.items(), key=lambda kv: kv[1], reverse=True)[:n]
+
+
+# ============================
 # RULE ENGINE
 # ============================
 
 def build_findings(
+    *,
     state: str,
     product_type: str,
     fields: Dict[str, str],
     panels_detected: Dict[str, bool],
     per_page_text: List[str],
     freshness_days: int,
+    d8_high_threshold_pct: float,
+    d9_present_threshold_pct: float,
+    dominant_cannabinoids: List[Tuple[str, float]],
+    dominant_terpenes: List[Tuple[str, float]],
 ) -> List[Finding]:
     findings: List[Finding] = []
 
@@ -358,7 +449,7 @@ def build_findings(
                 rule_id=f"{state}-DOC-TYPE-001",
                 title="Document appears R&D/QA oriented (not clearly a compliance COA)",
                 evidence=ev_rd,
-                recommendation="Confirm whether a compliance-form COA is required; request compliance COA if needed.",
+                recommendation="Confirm whether a compliance-form COA is required; request a compliance-form COA if needed.",
             )
         )
 
@@ -371,7 +462,7 @@ def build_findings(
                 rule_id=f"{state}-ACCRED-001",
                 title="Scope/accreditation limitation language detected",
                 evidence=ev_iso,
-                recommendation="Confirm whether scope limitations affect the weight/interpretation of the stated results.",
+                recommendation="Confirm whether scope limitations affect the interpretation of the stated results.",
             )
         )
 
@@ -405,20 +496,33 @@ def build_findings(
             )
         )
 
-    # INFO: potency
-    if fields.get("total_thc"):
-        ev = find_first_match(per_page_text, [r"Total\s*THC", re.escape(fields["total_thc"])])
+    # INFO: dominant cannabinoids
+    if dominant_cannabinoids:
+        top3 = ", ".join([f"{k} {v:.3f}%" for k, v in dominant_cannabinoids])
         findings.append(
             Finding(
                 severity="INFO",
-                rule_id=f"{state}-POT-INFO-001",
-                title="Total THC extracted",
-                evidence=Evidence(page_index=ev.page_index, snippet=f"Total THC: {fields['total_thc']}%"),
-                recommendation="None.",
+                rule_id=f"{state}-DOM-CAN-001",
+                title="Dominant cannabinoids (top)",
+                evidence=Evidence(page_index=None, snippet=top3),
+                recommendation="Use dominant cannabinoids to characterize product profile and support comparisons across lots.",
             )
         )
 
-    # OPTION 2: Terpenes always reported as INFO for MA/NJ (optional)
+    # INFO: dominant terpenes
+    if dominant_terpenes:
+        top3t = ", ".join([f"{k} {v:.3f}%" for k, v in dominant_terpenes])
+        findings.append(
+            Finding(
+                severity="INFO",
+                rule_id=f"{state}-DOM-TERP-001",
+                title="Dominant terpenes (top)",
+                evidence=Evidence(page_index=None, snippet=top3t),
+                recommendation="Use dominant terpenes to characterize aroma profile and support consistency review.",
+            )
+        )
+
+    # Option 2: Terpenes always reported as INFO for MA/NJ (optional)
     if "Terpenes" in OPTIONAL_PANELS_BY_STATE.get(state, []):
         if panels_detected.get("Terpenes"):
             ev = find_first_match(per_page_text, PANEL_KEYWORDS["Terpenes"])
@@ -441,6 +545,42 @@ def build_findings(
                     recommendation="None (terpenes are optional for this report).",
                 )
             )
+
+    # FLAG: high Δ8 when Δ9 also present (oil products)
+    # We rely on parsed cannabinoid numbers where available; otherwise we add an INFO that parsing was limited.
+    if product_type in OIL_PRODUCT_TYPES:
+        can_map = dict(dominant_cannabinoids)  # but dominant list might omit Δ8/Δ9
+        # Pull full parsed cannabinoids from session (we’ll pass via st.session_state)
+        full_can: Dict[str, float] = st.session_state.get("parsed_cannabinoids_full", {})
+
+        d8 = full_can.get("Δ8-THC")
+        d9 = full_can.get("Δ9-THC")
+
+        if d8 is None or d9 is None:
+            findings.append(
+                Finding(
+                    severity="INFO",
+                    rule_id=f"{state}-D8D9-INFO-001",
+                    title="Δ8/Δ9 presence check limited",
+                    evidence=Evidence(page_index=None, snippet="Δ8-THC and/or Δ9-THC values were not reliably extracted from the document text."),
+                    recommendation="Verify Δ8-THC and Δ9-THC values manually on the COA table.",
+                )
+            )
+        else:
+            if d9 >= d9_present_threshold_pct and d8 >= d8_high_threshold_pct:
+                ev = find_first_match(per_page_text, [r"(Δ\s*8\s*-\s*THC|Delta\s*8\s*THC|D8\s*THC)", r"(Δ\s*9\s*-\s*THC|Delta\s*9\s*THC|D9\s*THC)"])
+                findings.append(
+                    Finding(
+                        severity="WARN",
+                        rule_id=f"{state}-D8D9-WARN-001",
+                        title="High Δ8-THC detected while Δ9-THC is also present (oil product)",
+                        evidence=Evidence(
+                            page_index=ev.page_index,
+                            snippet=f"Extracted values: Δ8-THC {d8:.3f}% and Δ9-THC {d9:.3f}% (thresholds: Δ8 ≥ {d8_high_threshold_pct}%, Δ9 ≥ {d9_present_threshold_pct}%).",
+                        ),
+                        recommendation="Review manufacturing/process notes, verify analyte table and units, and confirm whether this profile is expected for the product and jurisdiction.",
+                    )
+                )
 
     return findings
 
@@ -481,6 +621,8 @@ def generate_pdf_report(
     fields: Dict[str, str],
     panels_detected: Dict[str, bool],
     findings: List[Finding],
+    dominant_cannabinoids: List[Tuple[str, float]],
+    dominant_terpenes: List[Tuple[str, float]],
     source_file_bytes: bytes,
 ) -> bytes:
     buf = io.BytesIO()
@@ -517,6 +659,24 @@ def generate_pdf_report(
     c.drawString(x, y, f"Overall Status: {status}")
     y -= 18
 
+    # Key profile box
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x, y, "Profile Summary (as extracted)")
+    y -= 14
+    c.setFont("Helvetica", 10)
+
+    if dominant_cannabinoids:
+        y = wrap_text(c, "Dominant cannabinoids: " + ", ".join([f"{k} {v:.3f}%" for k, v in dominant_cannabinoids]), x, y, width - 2 * margin)
+    else:
+        y = wrap_text(c, "Dominant cannabinoids: Not reliably extracted.", x, y, width - 2 * margin)
+
+    if dominant_terpenes:
+        y = wrap_text(c, "Dominant terpenes: " + ", ".join([f"{k} {v:.3f}%" for k, v in dominant_terpenes]), x, y, width - 2 * margin)
+    else:
+        y = wrap_text(c, "Dominant terpenes: Not reliably extracted / not reported.", x, y, width - 2 * margin)
+
+    y -= 6
+
     c.setFont("Helvetica-Bold", 12)
     c.drawString(x, y, "Key Identifiers (as extracted)")
     y -= 14
@@ -542,7 +702,7 @@ def generate_pdf_report(
     ]
     for k, v in identity:
         y = wrap_text(c, f"{k}: {v}", x, y, width - 2 * margin)
-        if y < margin + 90:
+        if y < margin + 110:
             c.showPage()
             y = height - margin
 
@@ -584,10 +744,9 @@ def generate_pdf_report(
     c.drawString(x, y, f"HOLD: {len(grouped['HOLD'])}   WARN: {len(grouped['WARN'])}   INFO: {len(grouped['INFO'])}")
     y -= 18
 
-    # ---- Page 2: Findings with recommendations ----
+    # ---- Page 2: Findings & Recommendations ----
     c.showPage()
     y = height - margin
-
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x, y, "Findings & Recommendations")
     y -= 18
@@ -640,8 +799,7 @@ def generate_pdf_report(
         c.setFont("Helvetica", 10)
         y = wrap_text(
             c,
-            "For each finding with a located page reference, the corresponding document page image is embedded below. "
-            "If OCR was used, the image reflects the source rendering used for OCR; text location may not be exact.",
+            "For each finding with a located page reference, the corresponding document page image is embedded below.",
             x,
             y,
             width - 2 * margin,
@@ -716,7 +874,7 @@ st.set_page_config(page_title="Leafline — COA Analyzer", layout="wide")
 init_db()
 
 st.title("Leafline — COA Analyzer")
-st.caption("Upload a COA to extract key details, check panels, and generate a PDF report.")
+st.caption("Upload a COA to extract key details, identify dominant cannabinoids/terpenes, apply state rules, and export a PDF report.")
 
 # Optional access gate (Streamlit secrets)
 if "LEAFLINE_PASSWORD" in st.secrets:
@@ -724,13 +882,21 @@ if "LEAFLINE_PASSWORD" in st.secrets:
     if pw != st.secrets["LEAFLINE_PASSWORD"]:
         st.stop()
 
-col1, col2, col3 = st.columns([1, 1, 1])
+col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 with col1:
     state = st.selectbox("Jurisdiction", STATE_OPTIONS, index=0)
 with col2:
     product_type = st.selectbox("Product type", PRODUCT_TYPES, index=0)
 with col3:
     freshness_days = st.number_input("Freshness threshold (days)", min_value=0, max_value=3650, value=365, step=30)
+with col4:
+    st.markdown("**Δ8/Δ9 flag (oil)**")
+
+c1, c2 = st.columns([1, 1])
+with c1:
+    d8_high_threshold_pct = st.number_input("Δ8 high threshold (%)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
+with c2:
+    d9_present_threshold_pct = st.number_input("Δ9 present threshold (%)", min_value=0.0, max_value=100.0, value=0.5, step=0.1)
 
 uploader = st.text_input("Reviewer identifier (optional)", value="")
 
@@ -814,6 +980,18 @@ if uploaded:
 
     fields = extract_fields(extracted_text)
     panels_detected = detect_panels(extracted_text)
+
+    # Parse full compound maps
+    parsed_cannabinoids_full = parse_compounds_from_text(per_page_text, CANNABINOID_ALIASES)
+    parsed_terpenes_full = parse_compounds_from_text(per_page_text, TERPENE_ALIASES)
+
+    # Store in session for rule engine (Δ8/Δ9 checks)
+    st.session_state["parsed_cannabinoids_full"] = parsed_cannabinoids_full
+    st.session_state["parsed_terpenes_full"] = parsed_terpenes_full
+
+    dominant_cannabinoids = top_n(parsed_cannabinoids_full, n=3)
+    dominant_terpenes = top_n(parsed_terpenes_full, n=3)
+
     findings = build_findings(
         state=state,
         product_type=product_type,
@@ -821,6 +999,10 @@ if uploaded:
         panels_detected=panels_detected,
         per_page_text=per_page_text,
         freshness_days=int(freshness_days),
+        d8_high_threshold_pct=float(d8_high_threshold_pct),
+        d9_present_threshold_pct=float(d9_present_threshold_pct),
+        dominant_cannabinoids=dominant_cannabinoids,
+        dominant_terpenes=dominant_terpenes,
     )
 
     status = overall_status(findings)
@@ -830,11 +1012,32 @@ if uploaded:
     # ON-SCREEN SUMMARY (BEFORE EXPORT)
     # ============================
     st.subheader("COA Summary")
+
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Status", status)
     s2.metric("HOLD", len(grouped["HOLD"]))
     s3.metric("WARN", len(grouped["WARN"]))
     s4.metric("INFO", len(grouped["INFO"]))
+
+    a1, a2 = st.columns(2)
+    with a1:
+        st.markdown("**Dominant cannabinoids (top 3):**")
+        if dominant_cannabinoids:
+            st.table([{"Cannabinoid": k, "Value (%)": round(v, 3)} for k, v in dominant_cannabinoids])
+        else:
+            st.write("Not reliably extracted.")
+
+    with a2:
+        st.markdown("**Dominant terpenes (top 3):**")
+        if dominant_terpenes:
+            st.table([{"Terpene": k, "Value (%)": round(v, 3)} for k, v in dominant_terpenes])
+        else:
+            st.write("Not reliably extracted / not reported.")
+
+    with st.expander("All extracted cannabinoids (debug)", expanded=False):
+        st.json(parsed_cannabinoids_full or {})
+    with st.expander("All extracted terpenes (debug)", expanded=False):
+        st.json(parsed_terpenes_full or {})
 
     st.write("**Key identifiers (as extracted):**")
     st.json({
@@ -851,7 +1054,6 @@ if uploaded:
         "collected_date": fields.get("collected_date", "Not detected"),
         "received_date": fields.get("received_date", "Not detected"),
         "completed_released_date": fields.get("completed_date", "Not detected"),
-        "total_thc": (fields.get("total_thc") + "%") if fields.get("total_thc") else "Not detected",
     })
 
     st.write("**Panels detected:**")
@@ -875,7 +1077,6 @@ if uploaded:
     with st.expander("Extracted text (debug)", expanded=False):
         st.text(extracted_text[:25000] if extracted_text else "No text extracted.")
 
-    # Export button does not mention litigation
     export_ready = st.checkbox("I reviewed the summary and want to generate the PDF report.", value=True)
 
     if export_ready:
@@ -893,6 +1094,8 @@ if uploaded:
             fields=fields,
             panels_detected=panels_detected,
             findings=findings,
+            dominant_cannabinoids=dominant_cannabinoids,
+            dominant_terpenes=dominant_terpenes,
             source_file_bytes=file_bytes if is_pdf else b"",
         )
 
