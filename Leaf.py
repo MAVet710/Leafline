@@ -13,7 +13,7 @@ import pandas as pd
 import pdfplumber
 from dateutil import parser as dateparser
 
-# OCR fallback
+# OCR fallback (no poppler needed)
 from PIL import Image
 import pypdfium2 as pdfium
 import pytesseract
@@ -27,12 +27,12 @@ from reportlab.pdfgen import canvas
 # Leafline — Batch COA Scanner
 # ============================
 APP_NAME = "Leafline"
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 DB_PATH = "leafline_audit.db"
 SUPPORTED_EXTS = (".pdf",)
 
 # ============================
-# Client flag criteria
+# Client-required flag logic
 # ============================
 EXPIRY_CUTOFF = date(2021, 11, 24)
 EARLY_YEAR_CUTOFF = 2020
@@ -42,21 +42,19 @@ DELTA8_TERMS = [r"delta\s*[-]?\s*8", r"\bdelta8\b", r"Δ\s*8", r"\bΔ8\b", r"\bD
 DELTA9_TERMS = [r"delta\s*[-]?\s*9", r"\bdelta9\b", r"Δ\s*9", r"\bΔ9\b", r"\bD9\b", r"\b9\s*THC\b"]
 
 THC_CONTEXT_TERMS = [r"\bTHC\b", r"tetrahydrocannabinol", r"\bcannabinoid\b", r"\bpotency\b"]
-EXPIRY_TERMS = [r"expir\w*", r"expiration\s*date", r"\bexp\s*date\b", r"\bdated\b", r"manufactur\w*", r"\bmfg\b"]
 
 PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
-RULESET_VERSION = "batch_flag_v1"
+RULESET_VERSION = "client_flag_v2"
 FED_RULESET_VERSION = "federal_hemp_v1"
 
 # ============================
 # Federal hemp thresholds
 # ============================
-HEMP_DELTA9_LIMIT = 0.3   # Farm Bill delta-9 THC limit (dry weight)
-HEMP_TOTAL_LIMIT = 0.3    # USDA production testing commonly references total THC
-HEMP_TOTAL_NEGLIGENT_CUTOFF = 1.0  # USDA negligent framework threshold (total THC)
-
-THCA_DECARB_FACTOR = 0.877  # THCA -> delta-9 THC equivalent
+HEMP_DELTA9_LIMIT = 0.3   # delta-9 THC (dry weight) limit
+HEMP_TOTAL_LIMIT = 0.3    # total THC (delta-9 + THCA*0.877) limit
+HEMP_TOTAL_NEGLIGENT_CUTOFF = 1.0  # severity bucket
+THCA_DECARB_FACTOR = 0.877
 
 
 # ============================
@@ -79,9 +77,11 @@ def init_db():
         source_filename TEXT NOT NULL,
         source_sha256 TEXT NOT NULL,
         source_size_bytes INTEGER NOT NULL,
+
         ruleset_version TEXT NOT NULL,
         fed_ruleset_version TEXT NOT NULL,
         app_version TEXT NOT NULL,
+
         parsing_method TEXT NOT NULL,
         max_pages_scanned INTEGER NOT NULL,
         ocr_used INTEGER NOT NULL,
@@ -90,8 +90,11 @@ def init_db():
         reasons TEXT,
         expiration_date TEXT,
         earliest_date_found TEXT,
+        expired_before_cutoff INTEGER NOT NULL,
+        has_early_date INTEGER NOT NULL,
 
         hemp_flag INTEGER NOT NULL,
+        hemp_severity TEXT,
         hemp_reasons TEXT,
         hemp_delta9_pct REAL,
         hemp_thca_pct REAL,
@@ -116,18 +119,21 @@ def db_insert_record(row: dict):
     cur.execute("""
     INSERT INTO records (
         record_id, created_at_utc, reviewer, source_filename, source_sha256, source_size_bytes,
-        ruleset_version, fed_ruleset_version, app_version, parsing_method, max_pages_scanned, ocr_used,
-        flagged, reasons, expiration_date, earliest_date_found,
-        hemp_flag, hemp_reasons, hemp_delta9_pct, hemp_thca_pct, hemp_total_thc_pct
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ruleset_version, fed_ruleset_version, app_version,
+        parsing_method, max_pages_scanned, ocr_used,
+        flagged, reasons, expiration_date, earliest_date_found, expired_before_cutoff, has_early_date,
+        hemp_flag, hemp_severity, hemp_reasons, hemp_delta9_pct, hemp_thca_pct, hemp_total_thc_pct
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["record_id"], row["created_at_utc"], row.get("reviewer"),
         row["source_filename"], row["source_sha256"], row["source_size_bytes"],
-        row["ruleset_version"], row["fed_ruleset_version"], row["app_version"], row["parsing_method"],
-        row["max_pages_scanned"], int(row["ocr_used"]),
+        row["ruleset_version"], row["fed_ruleset_version"], row["app_version"],
+        row["parsing_method"], row["max_pages_scanned"], int(row["ocr_used"]),
         int(row["flagged"]), row.get("reasons"),
         row.get("expiration_date"), row.get("earliest_date_found"),
-        int(row["hemp_flag"]), row.get("hemp_reasons"),
+        int(row.get("expired_before_cutoff", False)),
+        int(row.get("has_early_date", False)),
+        int(row["hemp_flag"]), row.get("hemp_severity"), row.get("hemp_reasons"),
         row.get("hemp_delta9_pct"), row.get("hemp_thca_pct"), row.get("hemp_total_thc_pct")
     ))
     conn.commit()
@@ -148,6 +154,7 @@ def db_insert_event(record_id: str, event_type: str, payload: dict):
     ))
     conn.commit()
     conn.close()
+
 
 # ============================
 # Parsing helpers
@@ -235,6 +242,10 @@ def extract_text_hybrid(pdf_bytes: bytes, max_pages: int, min_text_len: int, ocr
     return combined, "hybrid_text+ocr", True
 
 def text_has_thc_over_threshold(text: str, threshold: float) -> Tuple[bool, List[str]]:
+    """
+    Finds any % value > threshold that appears near THC/Δ8/Δ9 language.
+    Returns (found, evidence_snippets)
+    """
     evid = []
     if not text:
         return False, evid
@@ -247,58 +258,48 @@ def text_has_thc_over_threshold(text: str, threshold: float) -> Tuple[bool, List
         if val <= threshold:
             continue
 
-        start = max(m.start() - 60, 0)
-        end = min(m.end() + 60, len(text))
+        start = max(m.start() - 80, 0)
+        end = min(m.end() + 80, len(text))
         window = text[start:end]
 
         if re.search(r"\bTHC\b|tetrahydrocannabinol|Δ\s*8|Δ\s*9|delta\s*[-]?\s*[89]|\bD[89]\b", window, re.IGNORECASE):
             snippet = re.sub(r"\s+", " ", window).strip()
-            evid.append(f"{val:.3f}% near: {snippet[:160]}")
+            evid.append(f"{val:.3f}% near: {snippet[:180]}")
 
     return (len(evid) > 0), evid
 
+
 # ============================
-# Federal hemp extraction (delta-9, THCA, total THC)
+# Federal hemp extraction
 # ============================
 def _find_pct_after_label(text: str, labels: List[str]) -> Optional[float]:
-    """
-    Looks for patterns like:
-    'Total THC: 0.45%' or 'Δ9-THC 0.58756 %' etc.
-    OCR noise tolerant (spaces, hyphens).
-    """
     if not text:
         return None
     for lab in labels:
-        # label ... number %
         pat = rf"{lab}\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*%"
         m = re.search(pat, text, flags=re.IGNORECASE)
         if m:
             try:
                 return float(m.group(1))
             except Exception:
-                continue
+                pass
 
-        # Sometimes: label in table row where % appears later
         pat2 = rf"{lab}.*?(\d+(?:\.\d+)?)\s*%"
         m2 = re.search(pat2, text, flags=re.IGNORECASE | re.DOTALL)
         if m2:
             try:
                 return float(m2.group(1))
             except Exception:
-                continue
+                pass
     return None
 
 def extract_hemp_numbers(text: str) -> Dict[str, Optional[float]]:
-    """
-    Returns best-effort: delta9_pct, thca_pct, total_thc_pct
-    """
-    # Labels to try (OCR variants included)
     delta9_labels = [
-        r"Δ\s*9\s*[-]?\s*THC", r"delta\s*[-]?\s*9\s*[-]?\s*THC", r"\bD9\b.*?THC", r"\b9\b\s*THC",
-        r"delta\s*[-]?\s*9", r"Δ9", r"\bd9[-\s]*thc\b", r"\bdelta9\b"
+        r"Δ\s*9\s*[-]?\s*THC", r"delta\s*[-]?\s*9\s*[-]?\s*THC", r"\bd9[-\s]*thc\b",
+        r"delta\s*[-]?\s*9", r"\bdelta9\b", r"\bΔ9\b"
     ]
     thca_labels = [
-        r"\bTHCA\b", r"THC-a", r"THC\s*A", r"Δ\s*9\s*THC\s*A", r"delta\s*9\s*THC\s*A"
+        r"\bTHCA\b", r"THC[-\s]*A", r"THC\s*A"
     ]
     total_thc_labels = [
         r"total\s*THC", r"Total\s*THC", r"TotalTHC"
@@ -308,7 +309,6 @@ def extract_hemp_numbers(text: str) -> Dict[str, Optional[float]]:
     thca = _find_pct_after_label(text, thca_labels)
     total_thc = _find_pct_after_label(text, total_thc_labels)
 
-    # If "Total THC" not present, compute when possible
     if total_thc is None and (delta9 is not None or thca is not None):
         d9 = delta9 or 0.0
         a = thca or 0.0
@@ -317,13 +317,9 @@ def extract_hemp_numbers(text: str) -> Dict[str, Optional[float]]:
     return {"delta9_pct": delta9, "thca_pct": thca, "total_thc_pct": total_thc}
 
 def evaluate_federal_hemp(text: str,
-                          delta9_limit: float = HEMP_DELTA9_LIMIT,
-                          total_limit: float = HEMP_TOTAL_LIMIT,
-                          negligent_cutoff: float = HEMP_TOTAL_NEGLIGENT_CUTOFF) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Returns (hemp_flag, payload)
-    hemp_flag = True means: some federal-hemp-related breach condition detected.
-    """
+                          delta9_limit: float,
+                          total_limit: float,
+                          negligent_cutoff: float) -> Tuple[bool, Dict[str, Any]]:
     nums = extract_hemp_numbers(text)
     d9 = nums["delta9_pct"]
     thca = nums["thca_pct"]
@@ -332,29 +328,23 @@ def evaluate_federal_hemp(text: str,
     reasons: List[str] = []
     severity = "none"
 
-    # Farm Bill definition focuses on delta-9 THC <= 0.3%
     if d9 is not None and d9 > delta9_limit:
         reasons.append(f"Delta-9 THC exceeds {delta9_limit}% (delta-9 = {d9:.3f}%)")
         severity = "breach"
 
-    # USDA production program commonly relies on total THC
     if total is not None and total > total_limit:
         reasons.append(f"Total THC exceeds {total_limit}% (total = {total:.3f}%)")
         severity = "breach"
 
-    # Additional severity bucket per USDA violation framework
     if total is not None and total > negligent_cutoff:
         reasons.append(f"Total THC exceeds {negligent_cutoff}% (total = {total:.3f}%)")
         severity = "elevated"
 
-    # If we couldn’t extract numbers, note it (don’t mislead)
     if d9 is None and total is None:
         reasons.append("No reliable Delta-9/Total THC % found for federal hemp check (extraction limitation)")
         severity = "unknown"
 
-    hemp_flag = any(
-        ("exceeds" in r.lower() and "%" in r) for r in reasons
-    ) and severity in ("breach", "elevated")
+    hemp_flag = severity in ("breach", "elevated")
 
     payload = {
         "reasons": reasons,
@@ -362,58 +352,78 @@ def evaluate_federal_hemp(text: str,
         "delta9_pct": d9,
         "thca_pct": thca,
         "total_thc_pct": total,
-        "limits": {
-            "delta9_limit": delta9_limit,
-            "total_limit": total_limit,
-            "negligent_cutoff": negligent_cutoff,
-            "thca_decarb_factor": THCA_DECARB_FACTOR,
-        }
     }
     return hemp_flag, payload
 
+
 # ============================
-# Client flag evaluation
+# Client flag evaluation (UPDATED)
+# Must flag:
+# (Delta8 OR Delta9) AND (THC > 0.3) AND (Expired before 11/24/2021 OR date <= 2020)
 # ============================
 def evaluate_client_flag(text: str) -> Tuple[bool, Dict[str, Any]]:
     reasons: List[str] = []
 
     has_delta = any_term(text, DELTA8_TERMS) or any_term(text, DELTA9_TERMS)
     has_thc_context = any_term(text, THC_CONTEXT_TERMS)
-    has_exp_terms = any_term(text, EXPIRY_TERMS)
+
+    thc_over, thc_evidence = text_has_thc_over_threshold(text, CLIENT_THC_THRESHOLD)
 
     exp_date = extract_expiration_date(text)
     all_dates = extract_all_dates(text)
     early_dates = [d for d in all_dates if d.year <= EARLY_YEAR_CUTOFF]
 
-    thc_over, thc_evidence = text_has_thc_over_threshold(text, CLIENT_THC_THRESHOLD)
+    expired_before_cutoff = bool(exp_date and exp_date < EXPIRY_CUTOFF)
+    has_early_date = bool(early_dates)
 
+    # Friendly reasons
     if has_delta:
-        reasons.append("Δ8/Δ9 term detected")
+        reasons.append("Delta 8/9 term detected")
+    else:
+        reasons.append("No Delta 8/9 term detected")
+
     if has_thc_context:
         reasons.append("THC/cannabinoid context detected")
-    if has_exp_terms:
-        reasons.append("Expiration/dated/manufacture language detected")
+    else:
+        reasons.append("No THC/cannabinoid context detected")
 
     if thc_over:
-        reasons.append(f"THC-related % exceeds {CLIENT_THC_THRESHOLD}%")
+        reasons.append(f"THC level above {CLIENT_THC_THRESHOLD}% detected")
     else:
-        reasons.append(f"No THC % > {CLIENT_THC_THRESHOLD}% found near THC terms")
+        reasons.append(f"No THC level above {CLIENT_THC_THRESHOLD}% detected")
 
-    if exp_date and exp_date < EXPIRY_CUTOFF:
-        reasons.append(f"Expiration date before {EXPIRY_CUTOFF.isoformat()} ({exp_date.isoformat()})")
-    if early_dates:
+    if exp_date:
+        reasons.append(f"Expiration date found: {exp_date.isoformat()}")
+    else:
+        reasons.append("No expiration date found")
+
+    if expired_before_cutoff:
+        reasons.append(f"Expired before {EXPIRY_CUTOFF.isoformat()}")
+
+    if has_early_date:
         reasons.append(f"Contains date(s) in {EARLY_YEAR_CUTOFF} or earlier (e.g., {early_dates[0].isoformat()})")
 
-    flagged = bool(has_delta and has_thc_context and has_exp_terms and thc_over)
+    # FINAL required logic
+    date_condition = expired_before_cutoff or has_early_date
+    flagged = bool(has_delta and has_thc_context and thc_over and date_condition)
+
+    if not date_condition:
+        reasons.append(
+            f"Date condition not met (needs expired before {EXPIRY_CUTOFF.isoformat()} OR a date in {EARLY_YEAR_CUTOFF} or earlier)"
+        )
 
     details = {
         "expiration_date": exp_date.isoformat() if exp_date else "",
         "earliest_date_found": (
             early_dates[0].isoformat() if early_dates else (all_dates[0].isoformat() if all_dates else "")
         ),
+        "expired_before_cutoff": expired_before_cutoff,
+        "has_early_date": has_early_date,
         "thc_evidence": thc_evidence,
     }
+
     return flagged, {"reasons": reasons, "details": details}
+
 
 # ============================
 # PDF batch report generator
@@ -445,7 +455,7 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     max_w = width - 2 * margin
 
     total = len(rows)
-    flagged = sum(1 for r in rows if r.get("flagged") is True)
+    client_flagged = sum(1 for r in rows if r.get("flagged") is True)
     hemp_flagged = sum(1 for r in rows if r.get("hemp_flag") is True)
     created = utc_now_iso()
 
@@ -458,7 +468,7 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     y -= 12
     c.drawString(x, y, f"App: {APP_VERSION}   |   Rulesets: {RULESET_VERSION} / {FED_RULESET_VERSION}")
     y -= 12
-    c.drawString(x, y, f"Total PDFs scanned: {total}   |   Client-flagged: {flagged}   |   Hemp-flagged: {hemp_flagged}")
+    c.drawString(x, y, f"Total PDFs scanned: {total}   |   Flagged: {client_flagged}   |   Hemp-flagged: {hemp_flagged}")
     y -= 16
 
     c.setFont("Helvetica-Bold", 11)
@@ -467,12 +477,7 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     c.setFont("Helvetica", 10)
     y = wrap_text(
         c,
-        "Client flag if: (Δ8 or Δ9) AND (THC/cannabinoid context) AND (expiration/dated/manufacture language) AND (THC-related % > 0.3%).",
-        x, y, max_w
-    )
-    y = wrap_text(
-        c,
-        f"Date notes included: expiration date before {EXPIRY_CUTOFF.isoformat()} and/or any detected date in {EARLY_YEAR_CUTOFF} or earlier.",
+        f"Flag if: (Delta 8 or Delta 9) AND (THC > {CLIENT_THC_THRESHOLD}%) AND (Expired before {EXPIRY_CUTOFF.isoformat()} OR date in {EARLY_YEAR_CUTOFF} or earlier).",
         x, y, max_w
     )
     y -= 8
@@ -483,7 +488,7 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     c.setFont("Helvetica", 10)
     y = wrap_text(
         c,
-        "Hemp checks include Delta-9 THC (0.3% limit) and Total THC (Delta-9 + THCA*0.877) with severity if Total THC > 1.0%.",
+        "Hemp checks include Delta-9 THC and Total THC (Delta-9 + THCA*0.877). Severity increases if Total THC > 1.0%.",
         x, y, max_w
     )
     y -= 10
@@ -520,7 +525,7 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
         if r.get("earliest_date_found"):
             y = wrap_text(c, f"Earliest date found: {r['earliest_date_found']}", x, y, max_w, size=9, leading=11)
 
-        # Federal hemp numbers
+        # Federal hemp values
         d9 = r.get("hemp_delta9_pct")
         thca = r.get("hemp_thca_pct")
         tot = r.get("hemp_total_thc_pct")
@@ -544,8 +549,9 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     c.save()
     return buf.getvalue()
 
+
 # ============================
-# Streamlit UI (user friendly)
+# Streamlit UI
 # ============================
 st.set_page_config(page_title=f"{APP_NAME} — Batch COA Scanner", layout="wide")
 init_db()
@@ -618,7 +624,7 @@ if zip_up and run:
                         ocr_scale=ocr_scale
                     )
 
-                    # Client flag
+                    # Client flag (updated)
                     flagged, payload = evaluate_client_flag(text)
                     reasons_list = payload["reasons"]
                     details = payload["details"]
@@ -654,11 +660,13 @@ if zip_up and run:
                         "reasons": "; ".join(reasons_list),
                         "expiration_date": details.get("expiration_date") or "",
                         "earliest_date_found": details.get("earliest_date_found") or "",
+                        "expired_before_cutoff": details.get("expired_before_cutoff", False),
+                        "has_early_date": details.get("has_early_date", False),
                         "thc_evidence": details.get("thc_evidence") or [],
 
                         "hemp_flag": bool(hemp_flag),
-                        "hemp_reasons": "; ".join(hemp_payload.get("reasons", [])),
                         "hemp_severity": hemp_payload.get("severity", "none"),
+                        "hemp_reasons": "; ".join(hemp_payload.get("reasons", [])),
                         "hemp_delta9_pct": hemp_payload.get("delta9_pct"),
                         "hemp_thca_pct": hemp_payload.get("thca_pct"),
                         "hemp_total_thc_pct": hemp_payload.get("total_thc_pct"),
@@ -689,8 +697,11 @@ if zip_up and run:
                         "reasons": "; ".join(reasons_list),
                         "expiration_date": details.get("expiration_date") or None,
                         "earliest_date_found": details.get("earliest_date_found") or None,
+                        "expired_before_cutoff": details.get("expired_before_cutoff", False),
+                        "has_early_date": details.get("has_early_date", False),
 
                         "hemp_flag": bool(hemp_flag),
+                        "hemp_severity": hemp_payload.get("severity", "none"),
                         "hemp_reasons": "; ".join(hemp_payload.get("reasons", [])),
                         "hemp_delta9_pct": hemp_payload.get("delta9_pct"),
                         "hemp_thca_pct": hemp_payload.get("thca_pct"),
@@ -702,6 +713,8 @@ if zip_up and run:
                         "client_reasons": reasons_list,
                         "expiration_date": details.get("expiration_date"),
                         "earliest_date_found": details.get("earliest_date_found"),
+                        "expired_before_cutoff": details.get("expired_before_cutoff", False),
+                        "has_early_date": details.get("has_early_date", False),
                         "thc_evidence": (details.get("thc_evidence") or [])[:10],
                         "parsing_method": method,
                         "ocr_used": ocr_used,
@@ -735,11 +748,13 @@ if zip_up and run:
                         "reasons": f"ERROR: {e}",
                         "expiration_date": "",
                         "earliest_date_found": "",
+                        "expired_before_cutoff": False,
+                        "has_early_date": False,
                         "thc_evidence": [],
 
                         "hemp_flag": False,
-                        "hemp_reasons": "",
                         "hemp_severity": "none",
+                        "hemp_reasons": "",
                         "hemp_delta9_pct": None,
                         "hemp_thca_pct": None,
                         "hemp_total_thc_pct": None,
@@ -760,13 +775,14 @@ if rows:
         "created_at_utc": r["created_at_utc"],
         "filename": r["filename"],
 
-        "client_flagged": r["flagged"],
+        "flagged": r["flagged"],
+        "expired_before_cutoff": r.get("expired_before_cutoff", False),
+        "has_early_date": r.get("has_early_date", False),
         "reasons": r["reasons"],
 
         "hemp_flagged": r["hemp_flag"],
         "hemp_severity": r.get("hemp_severity", ""),
         "hemp_reasons": r.get("hemp_reasons", ""),
-
         "hemp_delta9_pct": r.get("hemp_delta9_pct"),
         "hemp_thca_pct": r.get("hemp_thca_pct"),
         "hemp_total_thc_pct": r.get("hemp_total_thc_pct"),
@@ -786,14 +802,14 @@ if rows:
     } for r in rows])
 
     total = len(df)
-    client_flag_ct = int(df["client_flagged"].sum())
+    client_flag_ct = int(df["flagged"].sum())
     hemp_flag_ct = int(df["hemp_flagged"].sum())
     err_ct = int((df["parsing_method"] == "error").sum())
     ocr_ct = int(df["ocr_used"].sum())
 
     c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
     c1.metric("Total scanned", total)
-    c2.metric("Client-flagged", client_flag_ct)
+    c2.metric("Flagged", client_flag_ct)
     c3.metric("Hemp-flagged", hemp_flag_ct)
     c4.metric("OCR used", ocr_ct)
     c5.metric("Errors", err_ct)
@@ -804,7 +820,7 @@ if rows:
     st.dataframe(df, use_container_width=True)
 
     st.subheader("Flagged (client or hemp)")
-    flagged_df = df[(df["client_flagged"] == True) | (df["hemp_flagged"] == True)].copy()
+    flagged_df = df[(df["flagged"] == True) | (df["hemp_flagged"] == True)].copy()
     if len(flagged_df) == 0:
         st.info("No PDFs matched the selected flag criteria.")
     else:
