@@ -13,7 +13,7 @@ import pandas as pd
 import pdfplumber
 from dateutil import parser as dateparser
 
-# OCR fallback (no poppler needed)
+# OCR fallback
 from PIL import Image
 import pypdfium2 as pdfium
 import pytesseract
@@ -27,7 +27,7 @@ from reportlab.pdfgen import canvas
 # Leafline — Batch COA Scanner
 # ============================
 APP_NAME = "Leafline"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.6.0"
 DB_PATH = "leafline_audit.db"
 SUPPORTED_EXTS = (".pdf",)
 
@@ -38,27 +38,24 @@ EXPIRY_CUTOFF = date(2021, 11, 24)
 EARLY_YEAR_CUTOFF = 2020
 CLIENT_THC_THRESHOLD = 0.3  # percent
 
-DELTA8_TERMS = [r"delta\s*[-]?\s*8", r"\bdelta8\b", r"Δ\s*8", r"\bΔ8\b", r"\bD8\b", r"\b8\s*THC\b"]
-DELTA9_TERMS = [r"delta\s*[-]?\s*9", r"\bdelta9\b", r"Δ\s*9", r"\bΔ9\b", r"\bD9\b", r"\b9\s*THC\b"]
+DELTA8_TERMS = [r"delta\s*[-]?\s*8", r"\bdelta8\b", r"Δ\s*8", r"\bΔ8\b", r"\bD8\b", r"\bd8[-\s]*thc\b"]
+DELTA9_TERMS = [r"delta\s*[-]?\s*9", r"\bdelta9\b", r"Δ\s*9", r"\bΔ9\b", r"\bD9\b", r"\bd9[-\s]*thc\b"]
 
 THC_CONTEXT_TERMS = [r"\bTHC\b", r"tetrahydrocannabinol", r"\bcannabinoid\b", r"\bpotency\b"]
 
-PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
-
-RULESET_VERSION = "client_flag_v2"
+RULESET_VERSION = "client_flag_v4_percent_column_ocr_parser"
 FED_RULESET_VERSION = "federal_hemp_v1"
 
 # ============================
 # Federal hemp thresholds
 # ============================
-HEMP_DELTA9_LIMIT = 0.3   # delta-9 THC (dry weight) limit
-HEMP_TOTAL_LIMIT = 0.3    # total THC (delta-9 + THCA*0.877) limit
-HEMP_TOTAL_NEGLIGENT_CUTOFF = 1.0  # severity bucket
+HEMP_DELTA9_LIMIT = 0.3
+HEMP_TOTAL_LIMIT = 0.3
+HEMP_TOTAL_NEGLIGENT_CUTOFF = 1.0
 THCA_DECARB_FACTOR = 0.877
 
-
 # ============================
-# Utilities / Audit DB
+# DB / audit utilities
 # ============================
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -98,7 +95,10 @@ def init_db():
         hemp_reasons TEXT,
         hemp_delta9_pct REAL,
         hemp_thca_pct REAL,
-        hemp_total_thc_pct REAL
+        hemp_total_thc_pct REAL,
+
+        potency_json TEXT,
+        percent_map_count INTEGER
     )
     """)
     cur.execute("""
@@ -122,8 +122,9 @@ def db_insert_record(row: dict):
         ruleset_version, fed_ruleset_version, app_version,
         parsing_method, max_pages_scanned, ocr_used,
         flagged, reasons, expiration_date, earliest_date_found, expired_before_cutoff, has_early_date,
-        hemp_flag, hemp_severity, hemp_reasons, hemp_delta9_pct, hemp_thca_pct, hemp_total_thc_pct
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        hemp_flag, hemp_severity, hemp_reasons, hemp_delta9_pct, hemp_thca_pct, hemp_total_thc_pct,
+        potency_json, percent_map_count
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["record_id"], row["created_at_utc"], row.get("reviewer"),
         row["source_filename"], row["source_sha256"], row["source_size_bytes"],
@@ -134,7 +135,8 @@ def db_insert_record(row: dict):
         int(row.get("expired_before_cutoff", False)),
         int(row.get("has_early_date", False)),
         int(row["hemp_flag"]), row.get("hemp_severity"), row.get("hemp_reasons"),
-        row.get("hemp_delta9_pct"), row.get("hemp_thca_pct"), row.get("hemp_total_thc_pct")
+        row.get("hemp_delta9_pct"), row.get("hemp_thca_pct"), row.get("hemp_total_thc_pct"),
+        row.get("potency_json"), int(row.get("percent_map_count", 0))
     ))
     conn.commit()
     conn.close()
@@ -155,10 +157,55 @@ def db_insert_event(record_id: str, event_type: str, payload: dict):
     conn.commit()
     conn.close()
 
+# ============================
+# Text + OCR extraction
+# ============================
+def extract_text_pdfplumber(pdf_bytes: bytes, max_pages: int = 6) -> str:
+    per_page = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for p in pdf.pages[:max_pages]:
+            per_page.append(p.extract_text() or "")
+    return "\n\n".join(per_page).strip()
+
+def render_pdf_pages_with_pdfium(pdf_bytes: bytes, max_pages: int = 6, scale: float = 2.2) -> List[Image.Image]:
+    images: List[Image.Image] = []
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    n = min(len(pdf), max_pages)
+    for i in range(n):
+        page = pdf[i]
+        pil_img = page.render(scale=scale).to_pil()
+        images.append(pil_img)
+    return images
+
+def ocr_images(images: List[Image.Image]) -> str:
+    out = []
+    for img in images:
+        gray = img.convert("L")
+        text = pytesseract.image_to_string(gray, config="--psm 6")
+        out.append(text)
+    return "\n\n".join(out).strip()
+
+def extract_text_hybrid(pdf_bytes: bytes, max_pages: int, min_text_len: int, ocr_scale: float) -> Tuple[str, str, bool]:
+    text = extract_text_pdfplumber(pdf_bytes, max_pages=max_pages)
+    if len(text) >= min_text_len:
+        return text, "pdf_text", False
+
+    images = render_pdf_pages_with_pdfium(pdf_bytes, max_pages=max_pages, scale=ocr_scale)
+    ocr_text = ocr_images(images)
+    combined = (text + "\n\n" + ocr_text).strip()
+    return combined, "hybrid_text+ocr", True
 
 # ============================
-# Parsing helpers
+# Generic helpers
 # ============================
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def any_term(text: str, patterns: List[str]) -> bool:
+    if not text:
+        return False
+    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
+
 def safe_parse_date(s: str) -> Optional[date]:
     try:
         d = dateparser.parse(s, dayfirst=False, yearfirst=False, fuzzy=True)
@@ -166,16 +213,10 @@ def safe_parse_date(s: str) -> Optional[date]:
     except Exception:
         return None
 
-def any_term(text: str, patterns: List[str]) -> bool:
-    if not text:
-        return False
-    return any(re.search(p, text, flags=re.IGNORECASE) for p in patterns)
-
 def extract_all_dates(text: str) -> List[date]:
     if not text:
         return []
     candidates = set()
-
     for m in re.finditer(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", text):
         candidates.add(m.group(1))
     for m in re.finditer(r"\b(\d{4}-\d{2}-\d{2})\b", text):
@@ -203,127 +244,201 @@ def extract_expiration_date(text: str) -> Optional[date]:
                 return d
     return None
 
-def extract_text_pdfplumber(pdf_bytes: bytes, max_pages: int = 6) -> str:
-    per_page = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages[:max_pages]:
-            per_page.append(p.extract_text() or "")
-    return "\n\n".join(per_page).strip()
-
-def render_pdf_pages_with_pdfium(pdf_bytes: bytes, max_pages: int = 6, scale: float = 2.2) -> List[Image.Image]:
-    images: List[Image.Image] = []
-    pdf = pdfium.PdfDocument(pdf_bytes)
-    n = min(len(pdf), max_pages)
-    for i in range(n):
-        page = pdf[i]
-        pil_img = page.render(scale=scale).to_pil()
-        images.append(pil_img)
-    return images
-
-def ocr_images(images: List[Image.Image]) -> str:
-    out = []
-    for img in images:
-        gray = img.convert("L")
-        text = pytesseract.image_to_string(gray, config="--psm 6")
-        out.append(text)
-    return "\n\n".join(out).strip()
-
-def extract_text_hybrid(pdf_bytes: bytes, max_pages: int, min_text_len: int, ocr_scale: float) -> Tuple[str, str, bool]:
-    """
-    Returns (text, method_label, ocr_used)
-    """
-    text = extract_text_pdfplumber(pdf_bytes, max_pages=max_pages)
-    if len(text) >= min_text_len:
-        return text, "pdf_text", False
-
-    images = render_pdf_pages_with_pdfium(pdf_bytes, max_pages=max_pages, scale=ocr_scale)
-    ocr_text = ocr_images(images)
-    combined = (text + "\n\n" + ocr_text).strip()
-    return combined, "hybrid_text+ocr", True
-
-def text_has_thc_over_threshold(text: str, threshold: float) -> Tuple[bool, List[str]]:
-    """
-    Finds any % value > threshold that appears near THC/Δ8/Δ9 language.
-    Returns (found, evidence_snippets)
-    """
-    evid = []
-    if not text:
-        return False, evid
-
-    for m in re.finditer(PCT_RE, text):
-        try:
-            val = float(m.group(1))
-        except Exception:
-            continue
-        if val <= threshold:
-            continue
-
-        start = max(m.start() - 80, 0)
-        end = min(m.end() + 80, len(text))
-        window = text[start:end]
-
-        if re.search(r"\bTHC\b|tetrahydrocannabinol|Δ\s*8|Δ\s*9|delta\s*[-]?\s*[89]|\bD[89]\b", window, re.IGNORECASE):
-            snippet = re.sub(r"\s+", " ", window).strip()
-            evid.append(f"{val:.3f}% near: {snippet[:180]}")
-
-    return (len(evid) > 0), evid
-
-
-# ============================
-# Federal hemp extraction
-# ============================
-def _find_pct_after_label(text: str, labels: List[str]) -> Optional[float]:
-    if not text:
+def _parse_float_or_nd(val: str) -> Optional[float]:
+    if val is None:
         return None
-    for lab in labels:
-        pat = rf"{lab}\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*%"
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                pass
+    s = str(val).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"nd|n\.d\.|not detected", s, flags=re.IGNORECASE):
+        return 0.0
+    s = s.replace(",", "")
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
 
-        pat2 = rf"{lab}.*?(\d+(?:\.\d+)?)\s*%"
-        m2 = re.search(pat2, text, flags=re.IGNORECASE | re.DOTALL)
-        if m2:
+# ============================
+# 1) TABLE extraction (when real tables exist)
+# ============================
+def extract_percent_column_maps_from_tables(pdf_bytes: bytes, max_pages: int = 6) -> Dict[str, Dict[str, Optional[float]]]:
+    """
+    Returns { analyte_key: {pct: float, loq: float|None, raw_name: str} }
+    """
+    results: Dict[str, Dict[str, Optional[float]]] = {}
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages[:max_pages]:
             try:
-                return float(m2.group(1))
+                tables = page.extract_tables() or []
             except Exception:
-                pass
+                tables = []
+
+            for table in tables:
+                if not table or len(table) < 2:
+                    continue
+
+                header = table[0]
+                header_norm = [_norm(h) for h in header]
+
+                pct_idx = None
+                for i, h in enumerate(header_norm):
+                    if h in ["%", "percent", "% w/w", "%ww", "percent w/w", "percent (w/w)"] or ("%" in h and "loq" not in h):
+                        pct_idx = i
+                        break
+                if pct_idx is None:
+                    continue
+
+                loq_idx = None
+                for i, h in enumerate(header_norm):
+                    if "loq" in h:
+                        loq_idx = i
+                        break
+
+                name_idx = None
+                for i, h in enumerate(header_norm):
+                    if any(k in h for k in ["analyte", "compound", "cannabinoid", "terpene", "name"]):
+                        name_idx = i
+                        break
+                if name_idx is None:
+                    name_idx = 0
+
+                for row in table[1:]:
+                    if not row or len(row) <= pct_idx:
+                        continue
+                    name = (row[name_idx] or "").strip()
+                    if not name:
+                        continue
+                    pct_val = _parse_float_or_nd(row[pct_idx])
+                    loq_val = _parse_float_or_nd(row[loq_idx]) if (loq_idx is not None and len(row) > loq_idx) else None
+                    if pct_val is None:
+                        continue
+
+                    key = _norm(name)
+                    if key not in results or (pct_val > (results[key].get("pct") or -1)):
+                        results[key] = {"pct": pct_val, "loq": loq_val, "raw_name": name}
+
+    return results
+
+# ============================
+# 2) OCR/Text “% column” row parser (for scanned COAs)
+# ============================
+ROW_LINE_RE = re.compile(
+    r"""^\s*
+        (?P<name>[A-Za-z0-9Δµ\-\(\)\/\.\'\s]{3,}?)     # analyte-ish label
+        \s+
+        (?P<pct>(?:\d+(?:\.\d+)?|ND))                 # first numeric is % column OR ND
+        (?:\s+%|\b)                                   # maybe a % sign, maybe OCR dropped it
+        (?:\s+(?P<mg>(?:\d+(?:\.\d+)?|ND)))?          # often next is mg/g (ignore)
+        (?:\s+(?:LOQ|LLOQ)\s*[:\-]?\s*(?P<loq>\d+(?:\.\d+)?|ND))?  # optional LOQ
+        \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
+
+def extract_percent_column_maps_from_text(text: str) -> Dict[str, Dict[str, Optional[float]]]:
+    """
+    For scanned PDFs: infer % column by taking the FIRST number after the analyte name on row-like lines.
+    This matches the COA layout where % column is the first numeric column.
+    """
+    results: Dict[str, Dict[str, Optional[float]]] = {}
+    if not text:
+        return results
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines:
+        # skip obvious noise
+        if len(ln) < 6:
+            continue
+        if re.search(r"prepared for|final authorization|remarks|page \d+ of|\bcoa\b", ln, re.I):
+            continue
+
+        m = ROW_LINE_RE.match(ln)
+        if not m:
+            continue
+
+        name = (m.group("name") or "").strip()
+        pct_raw = (m.group("pct") or "").strip()
+        loq_raw = (m.group("loq") or "").strip() if m.group("loq") else None
+
+        pct_val = _parse_float_or_nd(pct_raw)
+        if pct_val is None:
+            continue
+
+        loq_val = _parse_float_or_nd(loq_raw) if loq_raw else None
+        key = _norm(name)
+
+        # keep max pct for duplicates
+        if key not in results or pct_val > (results[key].get("pct") or -1):
+            results[key] = {"pct": pct_val, "loq": loq_val, "raw_name": name}
+
+    return results
+
+# ============================
+# Percent-map => Potency extractor
+# ============================
+def _lookup_pct(percent_map: Dict[str, Dict[str, Optional[float]]], patterns: List[str]) -> Optional[float]:
+    for k, v in percent_map.items():
+        for pat in patterns:
+            if re.search(pat, k, flags=re.IGNORECASE):
+                return v.get("pct")
     return None
 
-def extract_hemp_numbers(text: str) -> Dict[str, Optional[float]]:
-    delta9_labels = [
-        r"Δ\s*9\s*[-]?\s*THC", r"delta\s*[-]?\s*9\s*[-]?\s*THC", r"\bd9[-\s]*thc\b",
-        r"delta\s*[-]?\s*9", r"\bdelta9\b", r"\bΔ9\b"
-    ]
-    thca_labels = [
-        r"\bTHCA\b", r"THC[-\s]*A", r"THC\s*A"
-    ]
-    total_thc_labels = [
-        r"total\s*THC", r"Total\s*THC", r"TotalTHC"
-    ]
+def extract_potency(percent_map: Dict[str, Dict[str, Optional[float]]]) -> Dict[str, Optional[float]]:
+    """
+    Pull potency values from the % column map.
+    """
+    delta8 = _lookup_pct(percent_map, [r"delta\s*[-]?\s*8", r"\bΔ8\b", r"\bd8\b", r"delta\s*8\s*thc", r"d8[-\s]*thc"])
+    delta9 = _lookup_pct(percent_map, [r"delta\s*[-]?\s*9", r"\bΔ9\b", r"\bd9\b", r"delta\s*9\s*thc", r"d9[-\s]*thc"])
+    thca = _lookup_pct(percent_map, [r"\bthca\b", r"thc[-\s]*a", r"tetrahydrocannabinolic"])
+    total_thc = _lookup_pct(percent_map, [r"total\s*thc\b"])
+    total_potential_thc = _lookup_pct(percent_map, [r"total\s*potential\s*thc\b"])
 
-    delta9 = _find_pct_after_label(text, delta9_labels)
-    thca = _find_pct_after_label(text, thca_labels)
-    total_thc = _find_pct_after_label(text, total_thc_labels)
-
+    # Prefer explicit Total THC if available; else compute; else use Total Potential THC
+    computed_total = None
     if total_thc is None and (delta9 is not None or thca is not None):
         d9 = delta9 or 0.0
         a = thca or 0.0
-        total_thc = d9 + (a * THCA_DECARB_FACTOR)
+        computed_total = d9 + (a * THCA_DECARB_FACTOR)
 
-    return {"delta9_pct": delta9, "thca_pct": thca, "total_thc_pct": total_thc}
+    final_total = total_thc
+    if final_total is None and computed_total is not None:
+        final_total = computed_total
+    if final_total is None and total_potential_thc is not None:
+        final_total = total_potential_thc
 
-def evaluate_federal_hemp(text: str,
-                          delta9_limit: float,
-                          total_limit: float,
-                          negligent_cutoff: float) -> Tuple[bool, Dict[str, Any]]:
-    nums = extract_hemp_numbers(text)
-    d9 = nums["delta9_pct"]
-    thca = nums["thca_pct"]
-    total = nums["total_thc_pct"]
+    return {
+        "delta8_pct": delta8,
+        "delta9_pct": delta9,
+        "thca_pct": thca,
+        "total_thc_pct": final_total,
+        "total_potential_thc_pct": total_potential_thc
+    }
+
+def thc_over_threshold_from_percent_map(potency: Dict[str, Optional[float]], threshold: float) -> Tuple[bool, List[str]]:
+    evid = []
+    for label in ["total_thc_pct", "delta9_pct", "thca_pct", "delta8_pct", "total_potential_thc_pct"]:
+        val = potency.get(label)
+        if val is None:
+            continue
+        if val > threshold:
+            evid.append(f"{label}={val:.3f}% (from % column)")
+            return True, evid
+    evid.append("No % column potency value above threshold")
+    return False, evid
+
+# ============================
+# Federal hemp (percent-map first)
+# ============================
+def evaluate_federal_hemp_from_potency(potency: Dict[str, Optional[float]],
+                                      delta9_limit: float,
+                                      total_limit: float,
+                                      negligent_cutoff: float) -> Tuple[bool, Dict[str, Any]]:
+    d9 = potency.get("delta9_pct")
+    thca = potency.get("thca_pct")
+    total = potency.get("total_thc_pct")
 
     reasons: List[str] = []
     severity = "none"
@@ -341,33 +456,36 @@ def evaluate_federal_hemp(text: str,
         severity = "elevated"
 
     if d9 is None and total is None:
-        reasons.append("No reliable Delta-9/Total THC % found for federal hemp check (extraction limitation)")
+        reasons.append("No reliable Delta-9/Total THC % found in % column (extraction limitation)")
         severity = "unknown"
 
     hemp_flag = severity in ("breach", "elevated")
 
-    payload = {
+    return hemp_flag, {
         "reasons": reasons,
         "severity": severity,
         "delta9_pct": d9,
         "thca_pct": thca,
-        "total_thc_pct": total,
+        "total_thc_pct": total
     }
-    return hemp_flag, payload
-
 
 # ============================
-# Client flag evaluation (UPDATED)
+# Client flag (percent-map first)
 # Must flag:
 # (Delta8 OR Delta9) AND (THC > 0.3) AND (Expired before 11/24/2021 OR date <= 2020)
 # ============================
-def evaluate_client_flag(text: str) -> Tuple[bool, Dict[str, Any]]:
+def evaluate_client_flag(text: str, percent_map: Dict[str, Dict[str, Optional[float]]], potency: Dict[str, Optional[float]]) -> Tuple[bool, Dict[str, Any]]:
     reasons: List[str] = []
 
-    has_delta = any_term(text, DELTA8_TERMS) or any_term(text, DELTA9_TERMS)
-    has_thc_context = any_term(text, THC_CONTEXT_TERMS)
+    # Delta presence: from terms OR from % map potency
+    has_delta = (
+        any_term(text, DELTA8_TERMS) or any_term(text, DELTA9_TERMS) or
+        (potency.get("delta8_pct") is not None) or (potency.get("delta9_pct") is not None)
+    )
 
-    thc_over, thc_evidence = text_has_thc_over_threshold(text, CLIENT_THC_THRESHOLD)
+    has_thc_context = any_term(text, THC_CONTEXT_TERMS) or (potency.get("total_thc_pct") is not None) or (potency.get("total_potential_thc_pct") is not None)
+
+    thc_over, thc_evidence = thc_over_threshold_from_percent_map(potency, CLIENT_THC_THRESHOLD)
 
     exp_date = extract_expiration_date(text)
     all_dates = extract_all_dates(text)
@@ -376,21 +494,15 @@ def evaluate_client_flag(text: str) -> Tuple[bool, Dict[str, Any]]:
     expired_before_cutoff = bool(exp_date and exp_date < EXPIRY_CUTOFF)
     has_early_date = bool(early_dates)
 
-    # Friendly reasons
     if has_delta:
-        reasons.append("Delta 8/9 term detected")
+        reasons.append("Delta 8/9 detected")
     else:
-        reasons.append("No Delta 8/9 term detected")
-
-    if has_thc_context:
-        reasons.append("THC/cannabinoid context detected")
-    else:
-        reasons.append("No THC/cannabinoid context detected")
+        reasons.append("No Delta 8/9 detected")
 
     if thc_over:
-        reasons.append(f"THC level above {CLIENT_THC_THRESHOLD}% detected")
+        reasons.append(f"THC above {CLIENT_THC_THRESHOLD}% detected (from % column)")
     else:
-        reasons.append(f"No THC level above {CLIENT_THC_THRESHOLD}% detected")
+        reasons.append(f"No THC above {CLIENT_THC_THRESHOLD}% detected (from % column)")
 
     if exp_date:
         reasons.append(f"Expiration date found: {exp_date.isoformat()}")
@@ -403,7 +515,6 @@ def evaluate_client_flag(text: str) -> Tuple[bool, Dict[str, Any]]:
     if has_early_date:
         reasons.append(f"Contains date(s) in {EARLY_YEAR_CUTOFF} or earlier (e.g., {early_dates[0].isoformat()})")
 
-    # FINAL required logic
     date_condition = expired_before_cutoff or has_early_date
     flagged = bool(has_delta and has_thc_context and thc_over and date_condition)
 
@@ -414,16 +525,14 @@ def evaluate_client_flag(text: str) -> Tuple[bool, Dict[str, Any]]:
 
     details = {
         "expiration_date": exp_date.isoformat() if exp_date else "",
-        "earliest_date_found": (
-            early_dates[0].isoformat() if early_dates else (all_dates[0].isoformat() if all_dates else "")
-        ),
+        "earliest_date_found": (early_dates[0].isoformat() if early_dates else (all_dates[0].isoformat() if all_dates else "")),
         "expired_before_cutoff": expired_before_cutoff,
         "has_early_date": has_early_date,
         "thc_evidence": thc_evidence,
+        "potency": potency,
+        "percent_map_count": len(percent_map),
     }
-
     return flagged, {"reasons": reasons, "details": details}
-
 
 # ============================
 # PDF batch report generator
@@ -480,6 +589,7 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
         f"Flag if: (Delta 8 or Delta 9) AND (THC > {CLIENT_THC_THRESHOLD}%) AND (Expired before {EXPIRY_CUTOFF.isoformat()} OR date in {EARLY_YEAR_CUTOFF} or earlier).",
         x, y, max_w
     )
+    y = wrap_text(c, "THC values are pulled from the COA '% column' (tables when available; OCR row-parser otherwise).", x, y, max_w)
     y -= 8
 
     c.setFont("Helvetica-Bold", 11)
@@ -488,7 +598,7 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     c.setFont("Helvetica", 10)
     y = wrap_text(
         c,
-        "Hemp checks include Delta-9 THC and Total THC (Delta-9 + THCA*0.877). Severity increases if Total THC > 1.0%.",
+        "Hemp checks use Delta-9 THC and Total THC (Delta-9 + THCA*0.877) derived from the COA '% column' map.",
         x, y, max_w
     )
     y -= 10
@@ -519,13 +629,24 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
             f"Extraction: {r.get('parsing_method', '')} (OCR used: {bool(r.get('ocr_used'))}, pages scanned: {r.get('max_pages_scanned')})",
             x, y, max_w, size=9, leading=11
         )
+        y = wrap_text(c, f"% map rows parsed: {r.get('percent_map_count', 0)}", x, y, max_w, size=9, leading=11)
 
         if r.get("expiration_date"):
             y = wrap_text(c, f"Expiration date: {r['expiration_date']}", x, y, max_w, size=9, leading=11)
         if r.get("earliest_date_found"):
             y = wrap_text(c, f"Earliest date found: {r['earliest_date_found']}", x, y, max_w, size=9, leading=11)
 
-        # Federal hemp values
+        pot = r.get("potency") or {}
+        y = wrap_text(
+            c,
+            f"Potency (% column): total_thc={'' if pot.get('total_thc_pct') is None else f'{pot.get('total_thc_pct'):.3f}%'}  "
+            f"delta9={'' if pot.get('delta9_pct') is None else f'{pot.get('delta9_pct'):.3f}%'}  "
+            f"thca={'' if pot.get('thca_pct') is None else f'{pot.get('thca_pct'):.3f}%'}  "
+            f"delta8={'' if pot.get('delta8_pct') is None else f'{pot.get('delta8_pct'):.3f}%'}  "
+            f"total_potential_thc={'' if pot.get('total_potential_thc_pct') is None else f'{pot.get('total_potential_thc_pct'):.3f}%'}",
+            x, y, max_w, size=9, leading=11
+        )
+
         d9 = r.get("hemp_delta9_pct")
         thca = r.get("hemp_thca_pct")
         tot = r.get("hemp_total_thc_pct")
@@ -548,7 +669,6 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
 
     c.save()
     return buf.getvalue()
-
 
 # ============================
 # Streamlit UI
@@ -604,6 +724,23 @@ if zip_up and run:
                     pdf_bytes = z.read(name)
                     sha = sha256_bytes(pdf_bytes)
 
+                    # Extract text (OCR if needed)
+                    text, method, ocr_used = extract_text_hybrid(
+                        pdf_bytes,
+                        max_pages=max_pages,
+                        min_text_len=min_text_len,
+                        ocr_scale=ocr_scale
+                    )
+
+                    # Percent-map: tables first; if none, parse from OCR/text
+                    percent_map = extract_percent_column_maps_from_tables(pdf_bytes, max_pages=max_pages)
+                    source = "tables"
+                    if len(percent_map) == 0:
+                        percent_map = extract_percent_column_maps_from_text(text)
+                        source = "ocr_row_parser"
+
+                    potency = extract_potency(percent_map)
+
                     db_insert_event(record_id, "INGESTED", {
                         "filename": name,
                         "sha256": sha,
@@ -615,32 +752,22 @@ if zip_up and run:
                         "fed_ruleset_version": FED_RULESET_VERSION,
                         "app_version": APP_VERSION,
                         "enable_hemp": enable_hemp,
+                        "percent_map_count": len(percent_map),
+                        "percent_map_source": source,
+                        "potency": potency,
                     })
 
-                    text, method, ocr_used = extract_text_hybrid(
-                        pdf_bytes,
-                        max_pages=max_pages,
-                        min_text_len=min_text_len,
-                        ocr_scale=ocr_scale
-                    )
-
-                    # Client flag (updated)
-                    flagged, payload = evaluate_client_flag(text)
+                    # Client flag
+                    flagged, payload = evaluate_client_flag(text, percent_map, potency)
                     reasons_list = payload["reasons"]
                     details = payload["details"]
 
                     # Federal hemp
                     hemp_flag = False
-                    hemp_payload = {
-                        "reasons": [],
-                        "severity": "none",
-                        "delta9_pct": None,
-                        "thca_pct": None,
-                        "total_thc_pct": None,
-                    }
+                    hemp_payload = {"reasons": [], "severity": "none", "delta9_pct": None, "thca_pct": None, "total_thc_pct": None}
                     if enable_hemp:
-                        hemp_flag, hemp_payload = evaluate_federal_hemp(
-                            text,
+                        hemp_flag, hemp_payload = evaluate_federal_hemp_from_potency(
+                            potency,
                             delta9_limit=float(hemp_delta9_limit),
                             total_limit=float(hemp_total_limit),
                             negligent_cutoff=float(hemp_negligent_cutoff),
@@ -652,6 +779,7 @@ if zip_up and run:
                         "filename": name,
                         "sha256": sha,
                         "size_bytes": len(pdf_bytes),
+
                         "parsing_method": method,
                         "ocr_used": ocr_used,
                         "max_pages_scanned": max_pages,
@@ -670,6 +798,10 @@ if zip_up and run:
                         "hemp_delta9_pct": hemp_payload.get("delta9_pct"),
                         "hemp_thca_pct": hemp_payload.get("thca_pct"),
                         "hemp_total_thc_pct": hemp_payload.get("total_thc_pct"),
+
+                        "potency": potency,
+                        "percent_map_count": len(percent_map),
+                        "percent_map_source": source,
 
                         "ruleset_version": RULESET_VERSION,
                         "fed_ruleset_version": FED_RULESET_VERSION,
@@ -706,6 +838,9 @@ if zip_up and run:
                         "hemp_delta9_pct": hemp_payload.get("delta9_pct"),
                         "hemp_thca_pct": hemp_payload.get("thca_pct"),
                         "hemp_total_thc_pct": hemp_payload.get("total_thc_pct"),
+
+                        "potency_json": json.dumps(potency, ensure_ascii=False),
+                        "percent_map_count": len(percent_map)
                     })
 
                     db_insert_event(record_id, "EVALUATED", {
@@ -718,22 +853,16 @@ if zip_up and run:
                         "thc_evidence": (details.get("thc_evidence") or [])[:10],
                         "parsing_method": method,
                         "ocr_used": ocr_used,
-
+                        "percent_map_count": len(percent_map),
+                        "percent_map_source": source,
+                        "potency": potency,
                         "hemp_flag": bool(hemp_flag),
                         "hemp_severity": hemp_payload.get("severity"),
                         "hemp_reasons": hemp_payload.get("reasons", []),
-                        "hemp_values": {
-                            "delta9_pct": hemp_payload.get("delta9_pct"),
-                            "thca_pct": hemp_payload.get("thca_pct"),
-                            "total_thc_pct": hemp_payload.get("total_thc_pct"),
-                        }
                     })
 
                 except Exception as e:
-                    db_insert_event(record_id, "ERROR", {
-                        "filename": name,
-                        "error": str(e),
-                    })
+                    db_insert_event(record_id, "ERROR", {"filename": name, "error": str(e)})
                     out_rows.append({
                         "record_id": record_id,
                         "created_at_utc": created_at,
@@ -743,7 +872,6 @@ if zip_up and run:
                         "parsing_method": "error",
                         "ocr_used": False,
                         "max_pages_scanned": max_pages,
-
                         "flagged": False,
                         "reasons": f"ERROR: {e}",
                         "expiration_date": "",
@@ -751,14 +879,15 @@ if zip_up and run:
                         "expired_before_cutoff": False,
                         "has_early_date": False,
                         "thc_evidence": [],
-
                         "hemp_flag": False,
                         "hemp_severity": "none",
                         "hemp_reasons": "",
                         "hemp_delta9_pct": None,
                         "hemp_thca_pct": None,
                         "hemp_total_thc_pct": None,
-
+                        "potency": {},
+                        "percent_map_count": 0,
+                        "percent_map_source": "none",
                         "ruleset_version": RULESET_VERSION,
                         "fed_ruleset_version": FED_RULESET_VERSION,
                         "app_version": APP_VERSION,
@@ -783,18 +912,24 @@ if rows:
         "hemp_flagged": r["hemp_flag"],
         "hemp_severity": r.get("hemp_severity", ""),
         "hemp_reasons": r.get("hemp_reasons", ""),
-        "hemp_delta9_pct": r.get("hemp_delta9_pct"),
-        "hemp_thca_pct": r.get("hemp_thca_pct"),
-        "hemp_total_thc_pct": r.get("hemp_total_thc_pct"),
+
+        "pot_total_thc_pct": (r.get("potency") or {}).get("total_thc_pct"),
+        "pot_delta9_pct": (r.get("potency") or {}).get("delta9_pct"),
+        "pot_thca_pct": (r.get("potency") or {}).get("thca_pct"),
+        "pot_delta8_pct": (r.get("potency") or {}).get("delta8_pct"),
+        "pot_total_potential_thc_pct": (r.get("potency") or {}).get("total_potential_thc_pct"),
 
         "expiration_date": r["expiration_date"],
         "earliest_date_found": r["earliest_date_found"],
-        "thc_evidence": " | ".join(r.get("thc_evidence", [])[:3]),
+        "thc_evidence": " | ".join(r.get("thc_evidence", [])[:2]),
 
         "sha256": r["sha256"],
         "parsing_method": r["parsing_method"],
         "ocr_used": r["ocr_used"],
         "pages_scanned": r["max_pages_scanned"],
+
+        "percent_map_count": r.get("percent_map_count", 0),
+        "percent_map_source": r.get("percent_map_source", ""),
 
         "ruleset_version": r["ruleset_version"],
         "fed_ruleset_version": r["fed_ruleset_version"],
@@ -807,15 +942,15 @@ if rows:
     err_ct = int((df["parsing_method"] == "error").sum())
     ocr_ct = int(df["ocr_used"].sum())
 
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
+    c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 2])
     c1.metric("Total scanned", total)
     c2.metric("Flagged", client_flag_ct)
     c3.metric("Hemp-flagged", hemp_flag_ct)
     c4.metric("OCR used", ocr_ct)
     c5.metric("Errors", err_ct)
+    c6.metric("% rows parsed", int(df["percent_map_count"].fillna(0).sum()))
 
     st.divider()
-
     st.subheader("Batch results")
     st.dataframe(df, use_container_width=True)
 
@@ -828,7 +963,6 @@ if rows:
 
     st.divider()
     st.subheader("Export")
-
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download CSV",
