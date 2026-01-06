@@ -2,7 +2,7 @@
 """
 Leafline — Batch COA Scanner (litigation-grade)
 
-Hardened:
+Includes:
 - Percent-column extraction anchored to header "Percent" AND LOQ (prevents LOQ bleed).
 - Column-window extraction for % values (fixes wrong-number pulls).
 - OCR table auto-crop + dual OCR (normal + inverted), picks best.
@@ -75,7 +75,7 @@ DELTA9_TERMS = [
 ]
 THC_CONTEXT_TERMS = [r"\bTHC\b", r"tetrahydrocannabinol", r"\bcannabinoid\b", r"\bpotency\b"]
 
-RULESET_VERSION = "client_flag_v16_stress_hardened_percent_loq_window_merge_tokens_ranked_choice"
+RULESET_VERSION = "client_flag_v16_len_fix_loq_anchor_split_header_ocr_fallback"
 FED_RULESET_VERSION = "federal_hemp_v1"
 
 # ============================
@@ -128,7 +128,7 @@ def _parse_float_or_nd(val: str) -> Optional[float]:
     s = str(val).strip()
     if not s:
         return None
-    if re.fullmatch(r"nd|n\.d\.|not detected", s, flags=re.IGNORECASE):
+    if re.fullmatch(r"(?:nd|n\.d\.|n/d|not detected)", s, flags=re.IGNORECASE):
         return 0.0
     s = s.replace(",", "")
     m = re.search(r"(\d+(?:\.\d+)?)", s)
@@ -148,6 +148,17 @@ def _pct(part: int, total: int) -> str:
     if total <= 0:
         return "0.0%"
     return f"{(part / total) * 100.0:.1f}%"
+
+
+def safe_pdf_page_count(pdf_bytes: bytes) -> int:
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        try:
+            return len(pdfium.PdfDocument(pdf_bytes))
+        except Exception:
+            return 0
 
 
 # ============================
@@ -309,7 +320,6 @@ def _preprocess_for_ocr(img: Image.Image, mode: str = "thresh") -> Image.Image:
         g = g.point(lambda x: 255 if x > 185 else 0)
     elif mode == "invthresh":
         g = g.point(lambda x: 0 if x > 185 else 255)
-
     return g
 
 
@@ -339,13 +349,19 @@ def quick_table_crop(img: Image.Image) -> Optional[Tuple[int, int, int, int]]:
     Returns (l, t, r, b) in original image coordinates.
     """
     W, H = img.size
-    small = img.resize((max(1, int(W * 0.5)), max(1, int(H * 0.5))))
+    smallW = max(1, int(W * 0.5))
+    smallH = max(1, int(H * 0.5))
+    small = img.resize((smallW, smallH))
+    sx = W / float(smallW)
+    sy = H / float(smallH)
+
     d = pytesseract.image_to_data(
         _preprocess_for_ocr(small, "gray"),
         output_type=Output.DICT,
         config="--oem 1 --psm 11 -c preserve_interword_spaces=1",
     )
-    hits_y = []
+
+    hits_y: List[int] = []
     for i, txt in enumerate(d.get("text", [])):
         t = (txt or "").strip().lower()
         if not t:
@@ -356,12 +372,11 @@ def quick_table_crop(img: Image.Image) -> Optional[Tuple[int, int, int, int]]:
     if not hits_y:
         return None
 
-    top_small = min(hits_y)
-    top = int(top_small * 2)
+    top = int(min(hits_y) * sy)
 
-    t = max(0, top - 250)
-    b = min(H, t + int(H * 0.70))
-    return (0, t, W, b)
+    t0 = max(0, top - 250)
+    b0 = min(H, t0 + int(H * 0.70))
+    return (0, t0, W, b0)
 
 
 def ocr_data_images_mode(images: List[Tuple[int, Image.Image]], psm: int, mode: str) -> List[Dict[str, Any]]:
@@ -419,10 +434,11 @@ def extract_text_hybrid(
     min_text_len: int,
     ocr_scale: float,
 ) -> Tuple[str, str, bool]:
-    page_texts = []
+    page_texts: List[str] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        n_pages = len(pdf.pages)
         for i0 in page_indices_0:
-            if 0 <= i0 < len(pdf):
+            if 0 <= i0 < n_pages:
                 page_texts.append(pdf.pages[i0].extract_text() or "")
     text = "\n\n".join(page_texts).strip()
     if len(text) >= min_text_len:
@@ -522,7 +538,7 @@ def compute_effective_expiration(exp_date: Optional[date], analysis_completed_da
 
 
 # ============================
-# Potency extraction
+# Potency extraction (tables + OCR layout + inline)
 # ============================
 ANALYTE_KEYS: Dict[str, List[str]] = {
     "delta8_pct": [
@@ -538,7 +554,7 @@ ANALYTE_KEYS: Dict[str, List[str]] = {
     "total_potential_thc_pct": [r"\btotal\s*potential\s*thc\b", r"\bpotential\s*thc\b"],
 }
 
-_ND_RE = re.compile(r"\bnd\b|n\.d\.|not\s+detected|below\s+(?:lod|loq)|bdl|n/?a|none", re.IGNORECASE)
+_ND_RE = re.compile(r"\bnd\b|n\.d\.|n/d|not\s+detected", re.IGNORECASE)
 _NUM_RE = re.compile(r"(?<!\w)(\d+(?:\.\d+)?)(?!\w)")
 _HAS_PERCENT = re.compile(r"%")
 _HAS_MG_G = re.compile(r"\bmg\s*/?\s*g\b|\bmg\s+g\b", re.IGNORECASE)
@@ -551,11 +567,11 @@ DECARB_FORMULA_RE = re.compile(
 )
 
 INLINE_POTENCY_PATTERNS = {
-    "delta8_pct": [r"(?:delta\s*[-]?\s*8|Δ\s*[-]?\s*8|Δ8|d8)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
-    "delta9_pct": [r"(?:delta\s*[-]?\s*9|Δ\s*[-]?\s*9|Δ9|d9)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
-    "thca_pct": [r"\bthc[\s\-]*a\b\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
-    "total_thc_pct": [r"\btotal\s*thc\b\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
-    "total_potential_thc_pct": [r"\btotal\s*potential\s*thc\b\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
+    "delta8_pct": [r"(?:delta\s*[-]?\s*8|Δ\s*[-]?\s*8|Δ8|d8)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|n/d|not detected|\d+(?:\.\d+)?)\s*%"],
+    "delta9_pct": [r"(?:delta\s*[-]?\s*9|Δ\s*[-]?\s*9|Δ9|d9)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|n/d|not detected|\d+(?:\.\d+)?)\s*%"],
+    "thca_pct": [r"\bthc[\s\-]*a\b\s*[:\-]?\s*(nd|n\.d\.|n/d|not detected|\d+(?:\.\d+)?)\s*%"],
+    "total_thc_pct": [r"\btotal\s*thc\b\s*[:\-]?\s*(nd|n\.d\.|n/d|not detected|\d+(?:\.\d+)?)\s*%"],
+    "total_potential_thc_pct": [r"\btotal\s*potential\s*thc\b\s*[:\-]?\s*(nd|n\.d\.|n/d|not detected|\d+(?:\.\d+)?)\s*%"],
 }
 
 
@@ -600,127 +616,24 @@ def _normalize_to_percent(raw: float, line: str) -> Tuple[Optional[float], str, 
     return None, "low", "no_unit_ambiguous_le_20_rejected"
 
 
-def _parse_number_any(s: str) -> Optional[float]:
-    if not s:
-        return None
-    s2 = str(s).strip().lower().replace(",", "")
-    m = re.search(r"(\d+(?:\.\d+)?(?:e[+-]?\d+)?)", s2, flags=re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-
-def _unit_to_percent(val: float, raw_text: str) -> Tuple[float, str]:
-    t = (raw_text or "").lower()
-    if _HAS_MG_G.search(t):
-        return val / 10.0, "mg_g_div10"
-    if _HAS_MG_KG.search(t) or _HAS_PPM.search(t):
-        return val / 10000.0, "mgkg_or_ppm_div10000"
-    return val, "assume_percent"
-
-
-def _parse_percent_token(tok: str) -> Tuple[Optional[float], str]:
-    """
-    Robust token parser:
-      - accepts "0.12%", "<0.01%", "0.12", "< 0.01"
-      - accepts split artifacts like "0.12%w/w" (percent stripped)
-      - accepts scientific notation: 1.2e-2
-      - returns (value, note)
-    """
-    t = (tok or "").strip()
-    if not t:
-        return None, "empty"
-    if _ND_RE.search(t):
-        return 0.0, "nd"
-
-    t = t.replace("％", "%").replace(",", "").strip()
-    # Strip common suffixes
-    t = re.sub(r"(?:%|w/w|ww)\b", "", t, flags=re.IGNORECASE).strip()
-
-    m = re.fullmatch(r"(<)?\s*(\d+(?:\.\d+)?(?:e[+-]?\d+)?)", t, flags=re.IGNORECASE)
-    if not m:
-        m2 = re.search(r"(<)?\s*(\d+(?:\.\d+)?(?:e[+-]?\d+)?)", t, flags=re.IGNORECASE)
-        if not m2:
-            return None, "not_numeric"
-        val = float(m2.group(2))
-        return (val, "less_than") if m2.group(1) else (val, "numeric")
-
-    val = float(m.group(2))
-    return (val, "less_than") if m.group(1) else (val, "numeric")
-
-
-def _parse_header_anchored_cell_to_percent(cell: Any) -> Tuple[Optional[float], str]:
-    """
-    Parse a header-anchored %/LOQ cell to *percent*.
-    - supports ND/BDL
-    - supports "<0.01"
-    - supports ppm/mg/kg/mg/g and converts to percent
-    """
-    raw = "" if cell is None else str(cell)
-    if not raw.strip():
-        return None, "empty"
-    if _ND_RE.search(raw):
-        return 0.0, "nd"
-
-    # Keep "<" semantics but parse numeric
-    lt = "<" in raw
-    val = _parse_number_any(raw)
-    if val is None:
-        return None, "not_numeric"
-
-    pct, unit_note = _unit_to_percent(float(val), raw)
-    note = unit_note
-    if lt:
-        note = f"{note};less_than"
-    return pct, note
-
-
 def _extract_row_value(line: str) -> Tuple[Optional[float], str, str, str]:
-    """
-    Stress-hardened:
-    - if '%' present, choose number nearest '%' (avoids LOQ/sample-id numbers)
-    - if "loq" present, prefer rightmost parsed number
-    - else fallback to previous heuristic
-    """
-    if not line:
-        return None, "none", "empty_line", ""
-
-    nums = [(m.group(1), m.start()) for m in re.finditer(r"(\d+(?:\.\d+)?)", line)]
+    nums = [float(x) for x in _NUM_RE.findall(line)]
     if not nums:
         if _ND_RE.search(line):
             return 0.0, ("high" if _HAS_PERCENT.search(line) else "medium"), "nd_no_numbers", "ND"
         return None, "none", "no_numbers", ""
-
-    raw = None
-    if "%" in line:
-        pct_pos = line.find("%")
-        best = min(nums, key=lambda x: abs(x[1] - pct_pos))
-        raw = float(best[0])
-    elif re.search(r"\bloq\b", line, flags=re.IGNORECASE):
-        raw = float(nums[-1][0])
-    else:
-        # previous behavior
-        raw = float(nums[1][0]) if len(nums) >= 2 else float(nums[0][0])
-
+    raw = nums[1] if len(nums) >= 2 else nums[0]
     pct, conf, notes = _normalize_to_percent(raw, line)
     return pct, conf, notes, str(raw)
 
 
 def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int]) -> Tuple[Dict[str, Dict[str, Any]], List[PotencyEvidence]]:
-    """
-    Stress-hardened:
-    - percent column values are treated as percent directly (header-anchored), not unit-heuristic
-    - LOQ parsed + unit-converted if present
-    - avoids header "Percent LOQ" bleed by excluding headers containing loq/lod for pct_idx
-    """
     out: Dict[str, Dict[str, Any]] = {}
     evs: List[PotencyEvidence] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        n_pages = len(pdf.pages)
         for i0 in page_indices_0:
-            if not (0 <= i0 < len(pdf)):
+            if not (0 <= i0 < n_pages):
                 continue
             page = pdf.pages[i0]
             page_idx = i0 + 1
@@ -737,24 +650,11 @@ def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int])
 
                 pct_idx = None
                 loq_idx = None
-
                 for i, h in enumerate(header_norm):
-                    if loq_idx is None and ("loq" in h):
+                    if h in ["%", "percent", "% w/w", "%ww", "percent w/w", "percent (w/w)"] or ("percent" in h) or ("%" in h and "loq" not in h):
+                        pct_idx = i
+                    if "loq" in h:
                         loq_idx = i
-
-                for i, h in enumerate(header_norm):
-                    if pct_idx is not None:
-                        continue
-                    is_pctish = (
-                        h in ["%", "percent", "% w/w", "%ww", "percent w/w", "percent (w/w)"]
-                        or ("percent" in h)
-                        or ("%" in h)
-                    )
-                    if not is_pctish:
-                        continue
-                    if ("loq" in h) or ("lod" in h):
-                        continue
-                    pct_idx = i
 
                 if pct_idx is None:
                     continue
@@ -779,54 +679,37 @@ def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int])
                     if DECARB_FORMULA_RE.search(row_join):
                         continue
 
-                    pct_val, pct_note = _parse_header_anchored_cell_to_percent(row[pct_idx])
-                    if pct_val is None:
-                        continue
-
-                    pct, conf, notes = _normalize_to_percent_raw_from_header(float(pct_val))
-                    if pct is None:
+                    raw_val_cell = row[pct_idx]
+                    raw_val = _parse_float_or_nd(raw_val_cell)
+                    if raw_val is None:
                         continue
 
                     loq_val = None
-                    loq_note = None
                     if loq_idx is not None and loq_idx < len(row):
-                        loq_val, loq_note = _parse_header_anchored_cell_to_percent(row[loq_idx])
+                        loq_val = _parse_float_or_nd(row[loq_idx])
 
+                    pct, conf, notes = _normalize_to_percent(float(raw_val), row_join)
                     evs.append(PotencyEvidence(
-                        key=key,
-                        value_pct=pct,
-                        source="table",
-                        confidence=conf,
-                        page=page_idx,
-                        raw_name=raw_name[:120],
-                        raw_value=str(row[pct_idx])[:80],
-                        snippet=row_join[:240],
-                        notes=f"{notes}; token={pct_note}" + (f"; loq={loq_val} ({loq_note})" if loq_val is not None else ""),
+                        key=key, value_pct=pct, source="table", confidence=conf, page=page_idx,
+                        raw_name=raw_name[:120], raw_value=str(raw_val_cell)[:80],
+                        snippet=row_join[:240], notes=(notes + (f"; loq={loq_val}" if loq_val is not None else ""))
                     ))
 
-                    prev = out.get(key)
-                    cand = {
-                        "pct": float(pct),
-                        "loq": float(loq_val) if loq_val is not None else None,
-                        "source": "table",
-                        "page": page_idx,
-                        "confidence": conf,
-                        "raw_name": raw_name,
-                        "raw_value": str(row[pct_idx]),
-                        "snippet": row_join[:240],
-                        "notes": notes,
-                    }
-                    if prev is None:
-                        out[key] = cand
-                    else:
-                        # choose best later via combine_percent_maps ranking
-                        # but keep max pct if same source/conf to reduce churn
-                        try:
-                            if float(cand["pct"]) > float(prev.get("pct") or 0.0):
-                                out[key] = cand
-                        except Exception:
-                            out[key] = cand
-
+                    if pct is None:
+                        continue
+                    prev = out.get(key, {}).get("pct")
+                    if prev is None or pct > float(prev):
+                        out[key] = {
+                            "pct": pct,
+                            "loq": float(loq_val) if loq_val is not None else None,
+                            "source": "table",
+                            "page": page_idx,
+                            "confidence": conf,
+                            "raw_name": raw_name,
+                            "raw_value": str(raw_val_cell),
+                            "snippet": row_join[:240],
+                            "notes": notes,
+                        }
     return out, evs
 
 
@@ -863,49 +746,46 @@ def extract_percent_map_from_text_rows(text: str) -> Tuple[Dict[str, Dict[str, A
     return out, evs
 
 
-def _merge_tokens(tokens: List[dict], max_gap: int = 18) -> List[dict]:
-    """
-    Merge adjacent OCR tokens (same line) to handle "<" + "0.01" + "%" patterns.
-    tokens: sorted by x
-    output tokens carry merged text and approximate center x.
-    """
-    if not tokens:
-        return []
-    toks = sorted(tokens, key=lambda z: z["x"])
-    merged: List[dict] = []
-    cur = dict(t=toks[0]["t"], x=toks[0]["x"], y=toks[0]["y"], w=toks[0]["w"], h=toks[0]["h"])
-    for z in toks[1:]:
-        gap = z["x"] - (cur["x"] + cur["w"])
-        if gap <= max_gap:
-            cur["t"] = f"{cur['t']}{z['t']}"
-            cur["w"] = (z["x"] + z["w"]) - cur["x"]
-            cur["h"] = max(cur["h"], z["h"])
-        else:
-            cur["xc"] = cur["x"] + cur["w"] / 2.0
-            merged.append(cur)
-            cur = dict(t=z["t"], x=z["x"], y=z["y"], w=z["w"], h=z["h"])
-    cur["xc"] = cur["x"] + cur["w"] / 2.0
-    merged.append(cur)
-    return merged
+def _parse_percent_token(tok: str) -> Tuple[Optional[float], str]:
+    t = (tok or "").strip()
+    if not t:
+        return None, "empty"
+
+    t = t.replace(",", "").strip()
+
+    if t.endswith("%"):
+        t = t[:-1].strip()
+
+    # strip common OCR trailing junk (keeps digits, '.', '<')
+    t = re.sub(r"[^\d\.<]+$", "", t).strip()
+
+    if _ND_RE.fullmatch(t) or _ND_RE.search(t):
+        return 0.0, "nd"
+
+    m = re.fullmatch(r"(<)?\s*(\d+(?:\.\d+)?)", t)
+    if not m:
+        return None, "not_numeric"
+
+    val = float(m.group(2))
+    return (val, "less_than") if m.group(1) else (val, "numeric")
 
 
 def extract_percent_map_from_ocr_layout(
     ocr_pages_data: List[Dict[str, Any]]
 ) -> Tuple[Dict[str, Dict[str, Any]], List[PotencyEvidence]]:
     """
-    Stress-hardened:
-    - Finds Percent and LOQ headers even if on separate lines
-    - Handles Percent left of LOQ
-    - Merges split tokens: "<" + "0.01" + "%"
-    - Selects percent token closest to percent column AND not closer to LOQ
-    - Converts LOQ units when possible
+    Improved:
+    - Anchors LOQ + Percent columns (handles 'Percent' and '%')
+    - Extracts percent ONLY within a percent-column window (prevents LOQ bleed)
+    - Captures LOQ per-row when possible; stores it into map for later gating
+    - Accepts split headers (LOQ and Percent on adjacent lines)
     """
     out: Dict[str, Dict[str, Any]] = {}
     evs: List[PotencyEvidence] = []
 
     def build_words(d: Dict[str, Any]) -> List[dict]:
         n = len(d.get("text", []))
-        words = []
+        words: List[dict] = []
         for i in range(n):
             txt = (d["text"][i] or "").strip()
             if not txt:
@@ -934,60 +814,68 @@ def extract_percent_map_from_ocr_layout(
         ws2 = sorted(ws, key=lambda z: z["x"])
         return " ".join(z["t"] for z in ws2)
 
-    def _find_header(lines: List[List[dict]], kind: str, scan_lines: int = 90) -> Optional[Tuple[int, float]]:
-        """
-        kind: "loq" or "pct"
-        returns (line_idx, x_center)
-        """
-        for i, ws in enumerate(lines[:scan_lines]):
+    def _xs_for(ws: List[dict], pat: str) -> List[float]:
+        xs: List[float] = []
+        for z in ws:
+            if re.search(pat, z["t"], flags=re.I):
+                xs.append(float(z["xc"]))
+        return xs
+
+    def find_header_anchors(lines: List[List[dict]]) -> Optional[Dict[str, float]]:
+        # Primary: both LOQ and Percent on same line
+        for i, ws in enumerate(lines[:70]):
             s = _norm(line_text(ws))
-            if kind == "loq":
-                if "loq" not in s:
-                    continue
-                xs = [z["xc"] for z in ws if re.fullmatch(r"loq", (z["t"] or "").strip(), flags=re.I)]
-                if not xs:
-                    xs = [z["xc"] for z in ws if "loq" in (z["t"] or "").lower()]
+            if not (("loq" in s) and (("percent" in s) or ("%" in s))):
+                continue
+            loq_xs = _xs_for(ws, r"^loq$")
+            pct_xs = _xs_for(ws, r"%|percent")
+            if not loq_xs or not pct_xs:
+                continue
+            x_loq = float(sorted(loq_xs)[len(loq_xs) // 2])
+            pct_right = [x for x in pct_xs if x > x_loq + 10]
+            x_pct = float(sorted(pct_right)[len(pct_right) // 2]) if pct_right else float(sorted(pct_xs)[len(pct_xs) // 2])
+            return {"header_idx": float(i), "x_loq": x_loq, "x_pct": x_pct}
+
+        # Fallback: LOQ and Percent on adjacent/near lines
+        loq_candidates: List[Tuple[int, float]] = []
+        pct_candidates: List[Tuple[int, float]] = []
+        for i, ws in enumerate(lines[:80]):
+            s = _norm(line_text(ws))
+            if "loq" in s:
+                xs = _xs_for(ws, r"^loq$")
                 if xs:
-                    xs.sort()
-                    return i, float(xs[len(xs) // 2])
-            else:
-                if ("percent" not in s) and ("%" not in s):
-                    continue
-                xs = [z["xc"] for z in ws if re.search(r"%|percent", z["t"], flags=re.I)]
+                    loq_candidates.append((i, float(sorted(xs)[len(xs) // 2])))
+            if ("percent" in s) or ("%" in s):
+                xs = _xs_for(ws, r"%|percent")
                 if xs:
-                    xs.sort()
-                    return i, float(xs[len(xs) // 2])
-        return None
+                    pct_candidates.append((i, float(sorted(xs)[len(xs) // 2])))
 
-    def find_anchors(lines: List[List[dict]]) -> Optional[Dict[str, Any]]:
-        loq = _find_header(lines, "loq")
-        pct = _find_header(lines, "pct")
+        best: Optional[Dict[str, float]] = None
+        for i_loq, x_loq in loq_candidates:
+            for i_pct, x_pct0 in pct_candidates:
+                if abs(i_loq - i_pct) <= 2:
+                    header_idx = float(min(i_loq, i_pct))
+                    x_pct = x_pct0
+                    if x_pct <= x_loq + 10:
+                        # If OCR order is weird, nudge percent anchor right using tokens on that percent line
+                        ws = lines[i_pct]
+                        xs = _xs_for(ws, r"%|percent")
+                        if xs:
+                            x_pct = float(max(xs))
+                    cand = {"header_idx": header_idx, "x_loq": float(x_loq), "x_pct": float(x_pct)}
+                    if best is None or cand["header_idx"] < best["header_idx"]:
+                        best = cand
+        return best
 
-        if not pct:
-            return None
+    def parse_row(ws: List[dict], anchors: Dict[str, float]) -> Optional[Tuple[str, float, Optional[float], str, str]]:
+        x_loq = anchors["x_loq"]
+        x_pct = anchors["x_pct"]
 
-        i_pct, x_pct = pct
-        x_loq = None
-        i_loq = None
-        if loq:
-            i_loq, x_loq = loq
+        loq_window = 110
+        pct_left = (x_loq + x_pct) / 2.0
+        pct_right = x_pct + 160
 
-        header_idx = i_pct if i_loq is None else max(i_pct, i_loq)
-        return {"header_idx": header_idx, "x_pct": x_pct, "x_loq": x_loq}
-
-    def parse_row(ws: List[dict], anchors: Dict[str, Any]) -> Optional[Tuple[str, float, Optional[float], str, str, str]]:
-        """
-        Returns (key, pct_val, loq_val, raw_pct_token, raw_name, notes)
-        """
-        x_pct = float(anchors["x_pct"])
-        x_loq = anchors.get("x_loq")
-        x_loq_f = float(x_loq) if x_loq is not None else None
-
-        # Build analyte name tokens: left of the earlier column boundary
-        # If LOQ exists, boundary is min(x_loq, x_pct); else boundary is x_pct - margin
-        left_boundary = (min(x_pct, x_loq_f) - 20) if x_loq_f is not None else (x_pct - 120)
-
-        left_tokens = [z for z in ws if z["xc"] < left_boundary]
+        left_tokens = [z for z in ws if z["xc"] < pct_left - 8]
         if not left_tokens:
             return None
 
@@ -996,58 +884,41 @@ def extract_percent_map_from_ocr_layout(
         if not key:
             return None
 
-        # Candidate tokens in right half of line (avoid picking sample IDs on left)
-        right_tokens = [z for z in ws if z["xc"] >= left_boundary]
-        right_tokens = _merge_tokens(right_tokens)
-
-        # LOQ candidate: closest to x_loq
         loq_val = None
-        loq_note = None
-        if x_loq_f is not None:
-            loq_candidates = []
-            for z in right_tokens:
-                v, note = _parse_percent_token(z["t"])
-                if v is None:
-                    continue
-                loq_candidates.append((abs(z["xc"] - x_loq_f), float(v), z["t"], note))
-            if loq_candidates:
-                loq_candidates.sort(key=lambda x: x[0])
-                _, raw_loq, raw_tok, note = loq_candidates[0]
-                loq_val, loq_note = _parse_header_anchored_cell_to_percent(raw_tok)
-                if loq_val is None:
-                    loq_val = raw_loq
-                    loq_note = note
+        loq_candidates = [z for z in ws if abs(z["xc"] - x_loq) <= loq_window]
+        if loq_candidates:
+            loq_candidates.sort(key=lambda z: abs(z["xc"] - x_loq))
+            v, _note = _parse_percent_token(loq_candidates[0]["t"])
+            if v is not None:
+                loq_val = float(v)
 
-        # Percent candidate:
-        pct_candidates = []
-        for z in right_tokens:
+        pct_candidates = [z for z in ws if (z["xc"] >= pct_left) and (z["xc"] <= pct_right)]
+        scored: List[Tuple[float, float, str, str]] = []
+        for z in pct_candidates:
             v, note = _parse_percent_token(z["t"])
             if v is None:
                 continue
-            dx_pct = abs(z["xc"] - x_pct)
-            if dx_pct > 260:
-                continue
-            # Exclude LOQ bleed: if token is closer to LOQ than to Percent by a margin, skip
-            if x_loq_f is not None:
-                if abs(z["xc"] - x_loq_f) + 8 < dx_pct:
-                    continue
-            pct_candidates.append((dx_pct, float(v), z["t"], note))
+            scored.append((abs(z["xc"] - x_pct), float(v), z["t"], note))
 
-        if not pct_candidates:
+        if not scored:
+            pct_candidates2 = [z for z in ws if (z["xc"] >= pct_left)]
+            for z in pct_candidates2:
+                v, note = _parse_percent_token(z["t"])
+                if v is None:
+                    continue
+                scored.append((abs(z["xc"] - x_pct), float(v), z["t"], note))
+
+        if not scored:
             return None
 
-        pct_candidates.sort(key=lambda x: x[0])
-        _, raw_num, raw_tok, note = pct_candidates[0]
+        scored.sort(key=lambda x: x[0])
+        _, raw_num, raw_tok, note = scored[0]
 
-        pct, conf, notes = _normalize_to_percent_raw_from_header(raw_num)
+        pct, _conf, notes = _normalize_to_percent_raw_from_header(raw_num)
         if pct is None:
             return None
 
-        n2 = f"{notes}; token={note}"
-        if loq_val is not None:
-            n2 += f"; loq={loq_val} ({loq_note})"
-
-        return (key, float(pct), float(loq_val) if loq_val is not None else None, raw_tok, raw_name, n2)
+        return (key, float(pct), loq_val, raw_tok, raw_name)
 
     for d in ocr_pages_data:
         page0 = int(d.get("__page0__", -1))
@@ -1058,7 +929,7 @@ def extract_percent_map_from_ocr_layout(
             continue
 
         lines = cluster_lines(words)
-        anchors = find_anchors(lines)
+        anchors = find_header_anchors(lines)
         if not anchors:
             continue
 
@@ -1075,7 +946,7 @@ def extract_percent_map_from_ocr_layout(
             if not parsed:
                 continue
 
-            key, pct_val, loq_val, raw_tok, raw_name, notes = parsed
+            key, pct_val, loq_val, raw_tok, raw_name = parsed
 
             evs.append(PotencyEvidence(
                 key=key,
@@ -1084,23 +955,23 @@ def extract_percent_map_from_ocr_layout(
                 confidence="high",
                 page=page_idx,
                 raw_name=raw_name[:120],
-                raw_value=raw_tok[:40],
+                raw_value=str(raw_tok)[:40],
                 snippet=s[:240],
-                notes=notes[:240],
+                notes=("header_anchored_percent_col" + (f"; loq={loq_val}" if loq_val is not None else "")),
             ))
 
             prev = out.get(key, {}).get("pct")
             if prev is None or pct_val > float(prev):
                 out[key] = {
                     "pct": pct_val,
-                    "loq": loq_val,
+                    "loq": float(loq_val) if loq_val is not None else None,
                     "source": "ocr_layout",
                     "page": page_idx,
                     "confidence": "high",
                     "raw_name": raw_name,
-                    "raw_value": raw_tok,
+                    "raw_value": str(raw_tok),
                     "snippet": s[:240],
-                    "notes": notes[:240],
+                    "notes": ("header_anchored_percent_col" + (f"; loq={loq_val}" if loq_val is not None else "")),
                 }
 
     return out, evs
@@ -1129,35 +1000,6 @@ def extract_inline_potency(text: str) -> List[PotencyEvidence]:
     return out
 
 
-_CONF_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "computed": 3}
-_SOURCE_RANK = {"ocr_row": 1, "inline_text": 2, "ocr_layout": 3, "table": 4}
-
-
-def _pick_better(existing: Dict[str, Any], cand: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        e_conf = str(existing.get("confidence") or "none")
-        c_conf = str(cand.get("confidence") or "none")
-        e_src = str(existing.get("source") or "")
-        c_src = str(cand.get("source") or "")
-        e_pct = float(existing.get("pct") or 0.0)
-        c_pct = float(cand.get("pct") or 0.0)
-    except Exception:
-        return cand
-
-    er = (_CONF_RANK.get(e_conf, 0), _SOURCE_RANK.get(e_src, 0))
-    cr = (_CONF_RANK.get(c_conf, 0), _SOURCE_RANK.get(c_src, 0))
-
-    if cr > er:
-        return cand
-    if cr < er:
-        return existing
-
-    # tie: prefer value that is more conservative against false positives when low confidence
-    if _CONF_RANK.get(c_conf, 0) <= 1:
-        return existing if e_pct <= c_pct else cand
-    return cand if c_pct >= e_pct else existing
-
-
 def combine_percent_maps(*maps: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
     for m in maps:
@@ -1165,21 +1007,12 @@ def combine_percent_maps(*maps: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str
             if k not in out:
                 out[k] = v
             else:
-                out[k] = _pick_better(out[k], v)
+                try:
+                    if float(v.get("pct")) > float(out[k].get("pct")):
+                        out[k] = v
+                except Exception:
+                    pass
     return out
-
-
-def _should_apply_loq_gate(loq: Optional[float], pct: float) -> bool:
-    if loq is None:
-        return False
-    try:
-        loq_f = float(loq)
-    except Exception:
-        return False
-    # sanity bounds: LOQ percent values outside these are often unit/parse errors
-    if loq_f <= 0 or loq_f > 5.0:
-        return False
-    return pct < loq_f
 
 
 def extract_potency_from_map(percent_map: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Optional[float]], Dict[str, str]]:
@@ -1191,13 +1024,15 @@ def extract_potency_from_map(percent_map: Dict[str, Dict[str, Any]]) -> Tuple[Di
         if k in percent_map:
             pct = float(percent_map[k]["pct"])
             loq = percent_map[k].get("loq")
-            base_conf = str(percent_map[k].get("confidence") or "unknown")
 
-            if _should_apply_loq_gate(loq, pct):
-                pct = 0.0
-                conf[k] = "high"
-            else:
-                conf[k] = base_conf
+            try:
+                if loq is not None and pct < float(loq):
+                    pct = 0.0
+                    conf[k] = "high"
+                else:
+                    conf[k] = str(percent_map[k].get("confidence") or "unknown")
+            except Exception:
+                conf[k] = str(percent_map[k].get("confidence") or "unknown")
 
             potency[k] = pct
         else:
@@ -1261,21 +1096,17 @@ def evaluate_federal_hemp_from_potency(
     reasons: List[str] = []
     severity = "none"
 
-    breach = False
     if d9 is not None and float(d9) > delta9_limit:
         reasons.append(f"Delta-9 THC exceeds {delta9_limit}% (delta-9 = {float(d9):.3f}%)")
-        breach = True
+        severity = "breach"
 
     if total is not None and float(total) > total_limit:
         reasons.append(f"Total THC exceeds {total_limit}% (total = {float(total):.3f}%)")
-        breach = True
-
-    if breach:
         severity = "breach"
-    else:
-        if total is not None and float(total) > negligent_cutoff:
-            reasons.append(f"Total THC exceeds {negligent_cutoff}% (total = {float(total):.3f}%)")
-            severity = "elevated"
+
+    if total is not None and float(total) > negligent_cutoff:
+        reasons.append(f"Total THC exceeds {negligent_cutoff}% (total = {float(total):.3f}%)")
+        severity = "elevated"
 
     if d9 is None and total is None:
         reasons.append("No reliable Delta-9/Total THC % found")
@@ -1641,18 +1472,31 @@ def _run_pass(
     settings: ScanSettings,
     page_indices_0: List[int],
 ) -> Dict[str, Any]:
-    text, method, ocr_used_text = extract_text_hybrid(
-        pdf_bytes=pdf_bytes,
-        page_indices_0=page_indices_0,
-        min_text_len=settings.min_text_len,
-        ocr_scale=settings.ocr_scale,
-    )
+    # Text extraction: pdfplumber -> hybrid OCR -> OCR-only fallback
+    try:
+        text, method, ocr_used = extract_text_hybrid(
+            pdf_bytes=pdf_bytes,
+            page_indices_0=page_indices_0,
+            min_text_len=settings.min_text_len,
+            ocr_scale=settings.ocr_scale,
+        )
+    except Exception:
+        images_txt = render_pdf_pages_with_pdfium(pdf_bytes, page_indices_0, scale=settings.ocr_scale)
+        o1 = ocr_text_images(images_txt, psm=6)
+        o2 = ocr_text_images(images_txt, psm=11)
+        text, method, ocr_used = (o1 + "\n\n" + o2).strip(), "ocr_only_fallback", True
 
-    table_map, table_evs = extract_percent_map_from_tables(pdf_bytes, page_indices_0=page_indices_0)
+    # Table extraction: if it fails, continue with OCR layout + rows
+    try:
+        table_map, table_evs = extract_percent_map_from_tables(pdf_bytes, page_indices_0=page_indices_0)
+    except Exception:
+        table_map, table_evs = {}, []
+
     row_map, row_evs = extract_percent_map_from_text_rows(text)
 
     images = render_pdf_pages_with_pdfium(pdf_bytes, page_indices_0, scale=settings.ocr_scale)
 
+    # Dual OCR pass (normal + inverted), cropped to likely table region
     ocr_data_norm = ocr_data_images_mode(images, psm=6, mode="thresh")
     ocr_data_inv = ocr_data_images_mode(images, psm=6, mode="invthresh")
 
@@ -1694,17 +1538,16 @@ def _run_pass(
     evidence = payload["details"].get("evidence") or {}
     evidence["pages_used_0"] = page_indices_0
     evidence["ocr_mode_used_for_layout"] = ocr_mode_used
-    evidence["layout_ocr_used"] = True
     evidence["potency_evidence"] = [asdict(e) for e in (table_evs + layout_evs + row_evs + inline_evs)[:160]]
 
     return {
         "filename": name,
         "parsing_method": method,
-        "ocr_used": bool(ocr_used_text),
+        "ocr_used": ocr_used,
         "pages_scanned": len(page_indices_0),
         "page_indices_0": page_indices_0,
         "percent_map_count": len(percent_map),
-        "percent_map_source": "tables+ocr_layout(stress_hardened)+ocr_rows+inline_fill",
+        "percent_map_source": "tables+ocr_layout(loq_window)+ocr_rows+inline_fill",
         "potency": potency,
         "confidence": conf,
         "flagged": bool(flagged),
@@ -1719,8 +1562,10 @@ def scan_one_pdf(name: str, pdf_bytes: bytes, settings: ScanSettings) -> Dict[st
     created_at = utc_now_iso()
     sha = sha256_bytes(pdf_bytes)
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        total_pages = len(pdf)
+    total_pages = safe_pdf_page_count(pdf_bytes)
+    if total_pages <= 0:
+        raise RuntimeError("Unable to read PDF (page count = 0). Possibly encrypted/corrupt.")
+
     cap = min(settings.max_pages_cap, total_pages)
 
     p1_indices = list(range(min(settings.primary_pages, cap)))
@@ -1736,8 +1581,12 @@ def scan_one_pdf(name: str, pdf_bytes: bytes, settings: ScanSettings) -> Dict[st
         return strict_missing or date_missing or potency_missing
 
     if settings.enable_deep_scan and needs_more(best):
-        page_texts = extract_text_pdfplumber_pages(pdf_bytes, max_pages=cap)
-        rel = choose_relevant_pages_from_text(page_texts, max_pick=min(settings.relevant_page_pick, cap))
+        try:
+            page_texts = extract_text_pdfplumber_pages(pdf_bytes, max_pages=cap)
+            rel = choose_relevant_pages_from_text(page_texts, max_pick=min(settings.relevant_page_pick, cap))
+        except Exception:
+            rel = list(range(min(settings.relevant_page_pick, cap)))
+
         rel = sorted(set(rel + p1_indices))
         p2 = _run_pass(name, pdf_bytes, settings, rel)
         if _score_pass(p2) > _score_pass(best):
@@ -1955,6 +1804,7 @@ if zip_up and run:
                     completed += 1
                     prog.progress(completed / total)
             else:
+                # If your Streamlit hosting restricts multiprocessing, set Workers=1.
                 with ProcessPoolExecutor(max_workers=int(workers)) as ex:
                     futs = {ex.submit(scan_one_pdf, name, b, settings): name for name, b in items}
                     for fut in as_completed(futs):
