@@ -2,11 +2,13 @@
 """
 Leafline — Batch COA Scanner (litigation-grade)
 
-Extraction upgrades:
-- Keyword-based relevant page selection.
-- OCR with layout data (image_to_data) + header-anchored % column extraction.
-- Adaptive deep scan and optional full OCR fallback if key evidence still missing.
-- Label-anchored date extraction across newlines; blocks ID-like date tokens.
+Includes:
+- Percent-column extraction anchored to header "Percent" (handles 2-column layouts + "<0.01").
+- "Analysis Completed" treated as primary test date; effective expiration = (Analysis Completed + 365 days) if no explicit expiration.
+- Batch PDF report includes an Executive Summary narrative (2 paragraphs + key findings).
+
+Run:
+  streamlit run app.py
 """
 
 import io
@@ -20,7 +22,8 @@ import sqlite3
 import multiprocessing as mp
 from dataclasses import dataclass, asdict
 from datetime import datetime, date, timezone, timedelta
-from typing import List, Dict, Optional, Tuple, Any
+from collections import Counter
+from typing import List, Dict, Optional, Tuple, Any, Iterable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import streamlit as st
@@ -47,7 +50,7 @@ except RuntimeError:
 # App constants
 # ============================
 APP_NAME = "Leafline"
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.2"
 DB_PATH = "leafline_audit.db"
 SUPPORTED_EXTS = (".pdf",)
 
@@ -57,13 +60,19 @@ SUPPORTED_EXTS = (".pdf",)
 EXPIRY_CUTOFF = date(2021, 11, 24)
 EARLY_YEAR_CUTOFF = 2020
 CLIENT_THC_THRESHOLD = 0.3  # percent
-COA_VALIDITY_DAYS = 365
+COA_VALIDITY_DAYS = 365  # based on Analysis Completed
 
-DELTA8_TERMS = [r"delta\s*[-]?\s*8", r"\bdelta8\b", r"Δ\s*8", r"\bΔ8\b", r"\bD8\b", r"\bd8[-\s]*thc\b"]
-DELTA9_TERMS = [r"delta\s*[-]?\s*9", r"\bdelta9\b", r"Δ\s*9", r"\bΔ9\b", r"\bD9\b", r"\bd9[-\s]*thc\b"]
+DELTA8_TERMS = [
+    r"delta\s*[-]?\s*8", r"\bdelta8\b", r"Δ\s*[-]?\s*8", r"\bΔ8\b", r"\bD8\b", r"\bd8[-\s]*thc\b",
+    r"Δ\s*[-]?\s*8\s*thc",
+]
+DELTA9_TERMS = [
+    r"delta\s*[-]?\s*9", r"\bdelta9\b", r"Δ\s*[-]?\s*9", r"\bΔ9\b", r"\bD9\b", r"\bd9[-\s]*thc\b",
+    r"Δ\s*[-]?\s*9\s*thc",
+]
 THC_CONTEXT_TERMS = [r"\bTHC\b", r"tetrahydrocannabinol", r"\bcannabinoid\b", r"\bpotency\b"]
 
-RULESET_VERSION = "client_flag_v13_ocr_layout_relevant_pages"
+RULESET_VERSION = "client_flag_v14_percent_header_2col_analysis_completed_exec_summary"
 FED_RULESET_VERSION = "federal_hemp_v1"
 
 # ============================
@@ -76,7 +85,7 @@ THCA_DECARB_FACTOR = 0.877
 
 
 # ============================
-# Helpers
+# Generic helpers
 # ============================
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -88,6 +97,12 @@ def sha256_bytes(data: bytes) -> str:
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+
+def _norm_analyte(s: str) -> str:
+    s2 = (s or "").replace("Δ", "delta")
+    s2 = re.sub(r"\s+", " ", s2).strip().lower()
+    return s2.replace("–", "-").replace("—", "-")
 
 
 def any_term(text: str, patterns: List[str]) -> bool:
@@ -280,9 +295,7 @@ def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
     g = img.convert("L")
     g = ImageOps.autocontrast(g)
     g = g.filter(ImageFilter.SHARPEN)
-    # light denoise / threshold-ish
-    g = g.point(lambda p: 255 if p > 200 else p)
-    return g
+    return g.point(lambda p: 255 if p > 205 else p)
 
 
 def render_pdf_pages_with_pdfium(pdf_bytes: bytes, page_indices_0: List[int], scale: float) -> List[Tuple[int, Image.Image]]:
@@ -290,11 +303,9 @@ def render_pdf_pages_with_pdfium(pdf_bytes: bytes, page_indices_0: List[int], sc
     pdf = pdfium.PdfDocument(pdf_bytes)
     n = len(pdf)
     for i0 in page_indices_0:
-        if i0 < 0 or i0 >= n:
-            continue
-        page = pdf[i0]
-        pil_img = page.render(scale=scale).to_pil()
-        out.append((i0, pil_img))
+        if 0 <= i0 < n:
+            page = pdf[i0]
+            out.append((i0, page.render(scale=scale).to_pil()))
     return out
 
 
@@ -302,8 +313,7 @@ def ocr_text_images(images: List[Tuple[int, Image.Image]], psm: int) -> str:
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
     chunks = []
     for _, img in images:
-        g = _preprocess_for_ocr(img)
-        chunks.append(pytesseract.image_to_string(g, config=config))
+        chunks.append(pytesseract.image_to_string(_preprocess_for_ocr(img), config=config))
     return "\n\n".join(chunks).strip()
 
 
@@ -311,19 +321,18 @@ def ocr_data_images(images: List[Tuple[int, Image.Image]], psm: int) -> List[Dic
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
     out: List[Dict[str, Any]] = []
     for page0, img in images:
-        g = _preprocess_for_ocr(img)
-        d = pytesseract.image_to_data(g, output_type=Output.DICT, config=config)
+        d = pytesseract.image_to_data(_preprocess_for_ocr(img), output_type=Output.DICT, config=config)
         d["__page0__"] = page0
         out.append(d)
     return out
 
 
 # ============================
-# PDF text extraction (fast per-page + keyword selection)
+# PDF text extraction + relevant pages
 # ============================
 KEYWORDS = [
-    "thc", "delta", "cannabinoid", "potency", "mg/g", "percent", "%", "analysis", "tested", "date",
-    "results", "hplc", "gc", "coa", "report date", "date of analysis", "test date",
+    "percent", "%", "cannabinoid", "concentration", "potency", "delta", "thc", "thca",
+    "analysis completed", "date of analysis", "test date", "results",
 ]
 
 
@@ -358,36 +367,32 @@ def extract_text_hybrid(
     min_text_len: int,
     ocr_scale: float,
 ) -> Tuple[str, str, bool]:
-    # PDF text (only chosen pages)
     page_texts = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i0 in page_indices_0:
-            if i0 < 0 or i0 >= len(pdf):
-                continue
-            page_texts.append(pdf.pages[i0].extract_text() or "")
+            if 0 <= i0 < len(pdf):
+                page_texts.append(pdf.pages[i0].extract_text() or "")
     text = "\n\n".join(page_texts).strip()
-
     if len(text) >= min_text_len:
         return text, "pdf_text", False
 
     images = render_pdf_pages_with_pdfium(pdf_bytes, page_indices_0, scale=ocr_scale)
     o1 = ocr_text_images(images, psm=6)
-    o2 = ocr_text_images(images, psm=11)  # sparse layout helps on tables
-    combined = (text + "\n\n" + o1 + "\n\n" + o2).strip()
-    return combined, "hybrid_text+ocr", True
+    o2 = ocr_text_images(images, psm=11)
+    return (text + "\n\n" + o1 + "\n\n" + o2).strip(), "hybrid_text+ocr", True
 
 
 # ============================
-# Dates (label-anchored across newlines; blocks ID-like tokens)
+# Dates (Analysis Completed primary)
 # ============================
 MONTH_NAME_RE = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-
 DATE_TOKEN_NUMERIC = r"(?<![A-Za-z0-9-])(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})(?![A-Za-z0-9-])"
 DATE_TOKEN_TEXTUAL = rf"(?<![A-Za-z0-9-])({MONTH_NAME_RE}\s+\d{{1,2}}(?:,)?\s+\d{{4}}|\d{{1,2}}\s+{MONTH_NAME_RE}(?:,)?\s+\d{{4}})(?![A-Za-z0-9-])"
 
 DATE_LABELS: List[Tuple[str, int, str]] = [
-    ("date_tested", 1, r"\bdate\s*tested\b|\btest\s*date\b"),
+    ("analysis_completed", 1, r"\banalysis\s*completed\b|\banalysis\s*complete\b"),
     ("date_of_analysis", 1, r"\bdate\s*of\s*analysis\b|\banalysis\s*date\b|\bdate\s*analy(?:s|z)ed\b"),
+    ("date_tested", 1, r"\bdate\s*tested\b|\btest\s*date\b"),
     ("report_date", 2, r"\breport\s*date\b|\bdate\s*of\s*report\b|\bcoa\s*date\b|\bissued\s*date\b|\bdate\s*issued\b|\bdate\s*reported\b|\breported\s*on\b"),
     ("date_received", 3, r"\bdate\s*received\b|\breceived\s*date\b"),
     ("collection_date", 3, r"\bcollection\s*date\b|\bsample\s*date\b"),
@@ -411,7 +416,7 @@ def extract_labeled_dates_global(text: str) -> List[Tuple[date, DateEvidence, in
     if not text:
         return []
     out: List[Tuple[date, DateEvidence, int]] = []
-    window = 120
+    window = 140
 
     for kind, rank, label_pat in DATE_LABELS:
         label_re = re.compile(label_pat, re.IGNORECASE)
@@ -436,12 +441,11 @@ def extract_labeled_dates_global(text: str) -> List[Tuple[date, DateEvidence, in
             continue
         seen.add(k)
         uniq.append((d, ev, rank))
-
     uniq.sort(key=lambda x: (x[2], x[0]))
     return uniq
 
 
-def choose_best_test_date(labeled: List[Tuple[date, DateEvidence, int]]) -> Optional[Tuple[date, DateEvidence]]:
+def choose_best_analysis_completed_or_test_date(labeled: List[Tuple[date, DateEvidence, int]]) -> Optional[Tuple[date, DateEvidence]]:
     if not labeled:
         return None
     best_rank = min(r for _, _, r in labeled)
@@ -451,13 +455,17 @@ def choose_best_test_date(labeled: List[Tuple[date, DateEvidence, int]]) -> Opti
     return max(candidates, key=lambda x: x[0])
 
 
-def compute_effective_expiration(exp_date: Optional[date], test_date: Optional[date]) -> Tuple[Optional[date], Optional[DateEvidence]]:
+def compute_effective_expiration(exp_date: Optional[date], analysis_completed_date: Optional[date]) -> Tuple[Optional[date], Optional[DateEvidence]]:
     if exp_date:
         return exp_date, None
-    if test_date:
-        eff = test_date + timedelta(days=COA_VALIDITY_DAYS)
-        return eff, DateEvidence(kind="derived_expiration_365", value=eff.isoformat(), source="derived",
-                                 snippet=f"Derived: {test_date.isoformat()} + {COA_VALIDITY_DAYS} days")
+    if analysis_completed_date:
+        eff = analysis_completed_date + timedelta(days=COA_VALIDITY_DAYS)
+        return eff, DateEvidence(
+            kind="derived_expiration_365",
+            value=eff.isoformat(),
+            source="derived",
+            snippet=f"Derived: {analysis_completed_date.isoformat()} + {COA_VALIDITY_DAYS} days (Analysis Completed)",
+        )
     return None, None
 
 
@@ -465,8 +473,14 @@ def compute_effective_expiration(exp_date: Optional[date], test_date: Optional[d
 # Potency extraction (tables + OCR layout + inline)
 # ============================
 ANALYTE_KEYS: Dict[str, List[str]] = {
-    "delta8_pct": [r"\bdelta\s*[-]?\s*8\b", r"\bdelta8\b", r"\bΔ\s*8\b", r"\bΔ8\b", r"\bD8\b", r"\bd8[-\s]*thc\b"],
-    "delta9_pct": [r"\bdelta\s*[-]?\s*9\b", r"\bdelta9\b", r"\bΔ\s*9\b", r"\bΔ9\b", r"\bD9\b", r"\bd9[-\s]*thc\b"],
+    "delta8_pct": [
+        r"\bdelta\s*[-]?\s*8\b", r"\bdelta8\b", r"delta\s*[-]?\s*8\s*thc\b",
+        r"\bΔ\s*[-]?\s*8\b", r"\bΔ8\b", r"\bΔ\s*[-]?\s*8\s*thc\b", r"\bd8[-\s]*thc\b",
+    ],
+    "delta9_pct": [
+        r"\bdelta\s*[-]?\s*9\b", r"\bdelta9\b", r"delta\s*[-]?\s*9\s*thc\b",
+        r"\bΔ\s*[-]?\s*9\b", r"\bΔ9\b", r"\bΔ\s*[-]?\s*9\s*thc\b", r"\bd9[-\s]*thc\b",
+    ],
     "thca_pct": [r"\bthca\b", r"thc[-\s]*a\b", r"tetrahydrocannabinolic"],
     "total_thc_pct": [r"\btotal\s*thc\b", r"\bthc\s*total\b", r"\bmax\s*active\s*thc\b", r"\btotal\s*active\s*thc\b"],
     "total_potential_thc_pct": [r"\btotal\s*potential\s*thc\b", r"\bpotential\s*thc\b"],
@@ -485,8 +499,8 @@ DECARB_FORMULA_RE = re.compile(
 )
 
 INLINE_POTENCY_PATTERNS = {
-    "delta8_pct": [r"(?:delta\s*[-]?\s*8|Δ\s*8|Δ8|d8)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
-    "delta9_pct": [r"(?:delta\s*[-]?\s*9|Δ\s*9|Δ9|d9)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
+    "delta8_pct": [r"(?:delta\s*[-]?\s*8|Δ\s*[-]?\s*8|Δ8|d8)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
+    "delta9_pct": [r"(?:delta\s*[-]?\s*9|Δ\s*[-]?\s*9|Δ9|d9)\s*(?:thc)?\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
     "thca_pct": [r"\bthc[\s\-]*a\b\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
     "total_thc_pct": [r"\btotal\s*thc\b\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
     "total_potential_thc_pct": [r"\btotal\s*potential\s*thc\b\s*[:\-]?\s*(nd|n\.d\.|not detected|\d+(?:\.\d+)?)\s*%"],
@@ -494,11 +508,20 @@ INLINE_POTENCY_PATTERNS = {
 
 
 def _match_analyte_key(s: str) -> Optional[str]:
+    s2 = _norm_analyte(s)
     for k, pats in ANALYTE_KEYS.items():
         for p in pats:
-            if re.search(p, s, flags=re.IGNORECASE):
+            if re.search(p, s2, flags=re.IGNORECASE):
                 return k
     return None
+
+
+def _normalize_to_percent_raw_from_header(raw: float) -> Tuple[Optional[float], str, str]:
+    if raw < 0:
+        return None, "low", "negative_value"
+    if raw <= 100.0:
+        return raw, "high", "header_anchored_percent_col"
+    return None, "low", "header_anchored_out_of_range"
 
 
 def _normalize_to_percent(raw: float, line: str) -> Tuple[Optional[float], str, str]:
@@ -531,7 +554,6 @@ def _extract_row_value(line: str) -> Tuple[Optional[float], str, str, str]:
         if _ND_RE.search(line):
             return 0.0, ("high" if _HAS_PERCENT.search(line) else "medium"), "nd_no_numbers", "ND"
         return None, "none", "no_numbers", ""
-
     raw = nums[1] if len(nums) >= 2 else nums[0]
     pct, conf, notes = _normalize_to_percent(raw, line)
     return pct, conf, notes, str(raw)
@@ -542,7 +564,7 @@ def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int])
     evs: List[PotencyEvidence] = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i0 in page_indices_0:
-            if i0 < 0 or i0 >= len(pdf):
+            if not (0 <= i0 < len(pdf)):
                 continue
             page = pdf.pages[i0]
             page_idx = i0 + 1
@@ -559,7 +581,7 @@ def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int])
 
                 pct_idx = None
                 for i, h in enumerate(header_norm):
-                    if h in ["%", "percent", "% w/w", "%ww", "percent w/w", "percent (w/w)"] or ("%" in h and "loq" not in h):
+                    if h in ["%", "percent", "% w/w", "%ww", "percent w/w", "percent (w/w)"] or ("percent" in h) or ("%" in h and "loq" not in h):
                         pct_idx = i
                         break
                 if pct_idx is None:
@@ -567,7 +589,7 @@ def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int])
 
                 name_idx = 0
                 for i, h in enumerate(header_norm):
-                    if any(k in h for k in ["analyte", "compound", "cannabinoid", "name"]):
+                    if any(k in h for k in ["analyte", "compound", "cannabinoid", "name", "concentration"]):
                         name_idx = i
                         break
 
@@ -601,10 +623,8 @@ def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int])
                         continue
                     prev = out.get(key, {}).get("pct")
                     if prev is None or pct > float(prev):
-                        out[key] = {
-                            "pct": pct, "source": "table", "page": page_idx, "confidence": conf,
-                            "raw_name": raw_name, "raw_value": str(raw_val_cell), "snippet": row_join[:240], "notes": notes,
-                        }
+                        out[key] = {"pct": pct, "source": "table", "page": page_idx, "confidence": conf,
+                                    "raw_name": raw_name, "raw_value": str(raw_val_cell), "snippet": row_join[:240], "notes": notes}
     return out, evs
 
 
@@ -628,7 +648,7 @@ def extract_percent_map_from_text_rows(text: str) -> Tuple[Dict[str, Dict[str, A
 
         pct, conf, notes, raw_value = _extract_row_value(ln)
         evs.append(PotencyEvidence(
-            key=key, value_pct=pct, source="ocr_row", confidence=conf, page=None,
+            key=key, value_pct=pct, source="ocr_row", confidence=conf,
             raw_name=key, raw_value=raw_value[:80], snippet=ln[:240], notes=notes
         ))
 
@@ -636,23 +656,29 @@ def extract_percent_map_from_text_rows(text: str) -> Tuple[Dict[str, Dict[str, A
             continue
         prev = out.get(key, {}).get("pct")
         if prev is None or pct > float(prev):
-            out[key] = {
-                "pct": pct, "source": "ocr_row", "page": None, "confidence": conf,
-                "raw_name": key, "raw_value": raw_value, "snippet": ln[:240], "notes": notes,
-            }
+            out[key] = {"pct": pct, "source": "ocr_row", "page": None, "confidence": conf,
+                        "raw_name": key, "raw_value": raw_value, "snippet": ln[:240], "notes": notes}
     return out, evs
+
+
+def _parse_percent_token(tok: str) -> Tuple[Optional[float], str]:
+    t = (tok or "").strip()
+    if not t:
+        return None, "empty"
+    if _ND_RE.fullmatch(t) or _ND_RE.search(t):
+        return 0.0, "nd"
+    m = re.fullmatch(r"(<)?\s*(\d+(?:\.\d+)?)", t.replace(",", ""))
+    if not m:
+        return None, "not_numeric"
+    val = float(m.group(2))
+    if m.group(1):
+        return val, "less_than"
+    return val, "numeric"
 
 
 def extract_percent_map_from_ocr_layout(
     ocr_pages_data: List[Dict[str, Any]]
 ) -> Tuple[Dict[str, Dict[str, Any]], List[PotencyEvidence]]:
-    """
-    Header-anchored % column extraction using image_to_data boxes:
-    - find a header line containing '%' or 'percent'
-    - determine x-center of that header token (pct_col_x)
-    - for each subsequent line, pick number closest to pct_col_x as the % value
-    - analyte name = text left of pct_col_x
-    """
     out: Dict[str, Dict[str, Any]] = {}
     evs: List[PotencyEvidence] = []
 
@@ -666,8 +692,8 @@ def extract_percent_map_from_ocr_layout(
             txt = (d["text"][i] or "").strip()
             if not txt:
                 continue
-            conf = float(d["conf"][i]) if str(d["conf"][i]).isdigit() else -1.0
-            if conf >= 0 and conf < 35:
+            conf = float(d["conf"][i]) if str(d["conf"][i]).replace(".", "", 1).isdigit() else -1.0
+            if 0 <= conf < 35:
                 continue
             x, y, w, h = int(d["left"][i]), int(d["top"][i]), int(d["width"][i]), int(d["height"][i])
             words.append({"t": txt, "x": x, "y": y, "w": w, "h": h, "xc": x + w / 2.0})
@@ -677,7 +703,7 @@ def extract_percent_map_from_ocr_layout(
 
         words.sort(key=lambda z: (z["y"], z["x"]))
         lines: List[List[dict]] = []
-        y_tol = 12
+        y_tol = 14
         for w in words:
             if not lines:
                 lines.append([w])
@@ -694,14 +720,11 @@ def extract_percent_map_from_ocr_layout(
         header_idx = None
         pct_col_x = None
 
-        for i, ws in enumerate(lines[:25]):
+        for i, ws in enumerate(lines[:40]):
             s = _norm(line_text(ws))
-            if "percent" in s or "%" in s or " % " in f" {s} ":
-                # must also look like a table header
-                if any(k in s for k in ["mg/g", "mgg", "analyte", "cannabinoid", "compound", "result", "loq", "lod"]):
-                    xs = [z["xc"] for z in ws if z["t"] in ["%", "％"] or "percent" in _norm(z["t"])]
-                    if not xs:
-                        xs = [z["xc"] for z in ws if "%" in z["t"] or "percent" in _norm(z["t"])]
+            if "percent" in s or "%" in s:
+                if any(k in s for k in ["cannabinoid", "compound", "analyte", "concentration", "result", "percent", "%"]):
+                    xs = [z["xc"] for z in ws if "percent" in _norm(z["t"]) or z["t"] in ["%", "％"] or "%" in z["t"]]
                     if xs:
                         header_idx = i
                         pct_col_x = sorted(xs)[len(xs) // 2]
@@ -712,54 +735,56 @@ def extract_percent_map_from_ocr_layout(
 
         for ws in lines[header_idx + 1:]:
             s = line_text(ws)
-            if len(s) < 6:
+            if len(s) < 4:
                 continue
             if DECARB_FORMULA_RE.search(s):
                 continue
 
-            left_tokens = [z for z in ws if z["xc"] < pct_col_x - 10]
-            right_tokens = [z for z in ws if z["xc"] >= pct_col_x - 10]
+            left_tokens = [z for z in ws if z["xc"] < pct_col_x - 8]
+            right_tokens = [z for z in ws if z["xc"] >= pct_col_x - 8]
             if not left_tokens or not right_tokens:
                 continue
 
             name = " ".join(z["t"] for z in sorted(left_tokens, key=lambda z: z["x"]))
             key = _match_analyte_key(name)
             if not key:
-                # sometimes analyte in first token only
-                key = _match_analyte_key(" ".join(z["t"] for z in sorted(left_tokens, key=lambda z: z["x"])[:2]))
-            if not key:
                 continue
 
-            candidates = []
+            candidates: List[Tuple[float, float, str, str]] = []
             for z in right_tokens:
-                t = z["t"]
-                if _ND_RE.fullmatch(t) or _ND_RE.search(t):
-                    candidates.append((abs(z["xc"] - pct_col_x), 0.0, t))
+                tok = z["t"]
+                val, note = _parse_percent_token(tok)
+                if val is None:
                     continue
-                m = re.fullmatch(r"\d+(?:\.\d+)?", t.replace(",", ""))
-                if m:
-                    candidates.append((abs(z["xc"] - pct_col_x), float(m.group(0)), t))
+                candidates.append((abs(z["xc"] - pct_col_x), float(val), tok, note))
 
             if not candidates:
                 continue
-            candidates.sort(key=lambda x: x[0])
-            _, raw_num, raw_tok = candidates[0]
 
-            # Header anchored => percent column
-            pct = raw_num
-            conf = "high"
-            snippet = s[:240]
+            candidates.sort(key=lambda x: x[0])
+            _, raw_num, raw_tok, note = candidates[0]
+
+            pct, conf, notes = _normalize_to_percent_raw_from_header(raw_num)
+            if pct is None:
+                continue
 
             evs.append(PotencyEvidence(
                 key=key, value_pct=pct, source="ocr_layout", confidence=conf, page=page_idx,
-                raw_name=name[:120], raw_value=raw_tok[:40], snippet=snippet, notes="header_anchored_percent_col"
+                raw_name=name[:120], raw_value=raw_tok[:40], snippet=s[:240],
+                notes=f"{notes}; token={note}"
             ))
 
             prev = out.get(key, {}).get("pct")
             if prev is None or pct > float(prev):
                 out[key] = {
-                    "pct": pct, "source": "ocr_layout", "page": page_idx, "confidence": conf,
-                    "raw_name": name, "raw_value": raw_tok, "snippet": snippet, "notes": "header_anchored_percent_col",
+                    "pct": pct,
+                    "source": "ocr_layout",
+                    "page": page_idx,
+                    "confidence": conf,
+                    "raw_name": name,
+                    "raw_value": raw_tok,
+                    "snippet": s[:240],
+                    "notes": f"{notes}; token={note}",
                 }
 
     return out, evs
@@ -783,7 +808,7 @@ def extract_inline_potency(text: str) -> List[PotencyEvidence]:
         if best is not None:
             out.append(PotencyEvidence(
                 key=key, value_pct=best[0], source="inline_text", confidence="high",
-                page=None, raw_name=key, raw_value=str(best[0]), snippet=best[1], notes="explicit_percent_inline",
+                raw_name=key, raw_value=str(best[0]), snippet=best[1], notes="explicit_percent_inline",
             ))
     return out
 
@@ -795,7 +820,6 @@ def combine_percent_maps(*maps: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str
             if k not in out:
                 out[k] = v
             else:
-                # keep higher value
                 try:
                     if float(v.get("pct")) > float(out[k].get("pct")):
                         out[k] = v
@@ -807,7 +831,9 @@ def combine_percent_maps(*maps: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str
 def extract_potency_from_map(percent_map: Dict[str, Dict[str, Any]]) -> Tuple[Dict[str, Optional[float]], Dict[str, str]]:
     potency: Dict[str, Optional[float]] = {}
     conf: Dict[str, str] = {}
-    for k in ["delta8_pct", "delta9_pct", "thca_pct", "total_thc_pct", "total_potential_thc_pct"]:
+
+    keys = ["delta8_pct", "delta9_pct", "thca_pct", "total_thc_pct", "total_potential_thc_pct"]
+    for k in keys:
         if k in percent_map:
             potency[k] = float(percent_map[k]["pct"])
             conf[k] = str(percent_map[k].get("confidence") or "unknown")
@@ -919,11 +945,11 @@ def evaluate_client_flag_litigation(
 
     exp_date, exp_ev = extract_expiration_date(text)
     labeled = extract_labeled_dates_global(text)
-    best_test = choose_best_test_date(labeled)
-    test_date = best_test[0] if best_test else None
-    test_ev = best_test[1] if best_test else None
+    best = choose_best_analysis_completed_or_test_date(labeled)
+    analysis_completed_date = best[0] if best else None
+    analysis_ev = best[1] if best else None
 
-    eff_exp_date, derived_ev = compute_effective_expiration(exp_date, test_date)
+    eff_exp_date, derived_ev = compute_effective_expiration(exp_date, analysis_completed_date)
 
     expired_before_cutoff = bool(eff_exp_date and eff_exp_date < EXPIRY_CUTOFF)
     expired_as_of_scan = bool(eff_exp_date and eff_exp_date < scan_date)
@@ -944,7 +970,11 @@ def evaluate_client_flag_litigation(
     reasons.append(f"THC above {CLIENT_THC_THRESHOLD}% detected" if thc_over else f"No THC above {CLIENT_THC_THRESHOLD}% detected")
 
     reasons.append(f"Explicit expiration date found: {exp_date.isoformat()}" if exp_date else "No explicit expiration date found")
-    reasons.append(f"Best test/analysis date found: {test_date.isoformat()}" if test_date else "No label-anchored test/analysis date found")
+    reasons.append(
+        f"Analysis Completed / primary date found: {analysis_completed_date.isoformat()}"
+        if analysis_completed_date else
+        "No label-anchored Analysis Completed/Test/Analysis date found"
+    )
     reasons.append(f"Effective expiration date: {eff_exp_date.isoformat()}" if eff_exp_date else "No effective expiration date available")
 
     if expired_before_cutoff:
@@ -972,7 +1002,7 @@ def evaluate_client_flag_litigation(
     evidence["thc_over_evidence"] = thc_ev
     evidence["expiration_evidence"] = asdict(exp_ev) if exp_ev else None
     evidence["derived_expiration_evidence"] = asdict(derived_ev) if derived_ev else None
-    evidence["best_test_date_evidence"] = asdict(test_ev) if test_ev else None
+    evidence["best_analysis_completed_evidence"] = asdict(analysis_ev) if analysis_ev else None
     evidence["labeled_date_evidence"] = [asdict(ev) for _, ev, _ in labeled[:12]]
     evidence["potency_confidence"] = conf
 
@@ -980,7 +1010,7 @@ def evaluate_client_flag_litigation(
         "has_delta8": has_delta8,
         "has_delta9": has_delta9,
         "scan_date": scan_date.isoformat(),
-        "test_date": test_date.isoformat() if test_date else "",
+        "test_date": analysis_completed_date.isoformat() if analysis_completed_date else "",
         "expiration_date": exp_date.isoformat() if exp_date else "",
         "effective_expiration_date": eff_exp_date.isoformat() if eff_exp_date else "",
         "earliest_date_found": earliest_found,
@@ -996,7 +1026,7 @@ def evaluate_client_flag_litigation(
 
 
 # ============================
-# Report
+# PDF report generator + Executive Summary
 # ============================
 def wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, size=10, leading=12) -> float:
     c.setFont("Helvetica", size)
@@ -1016,6 +1046,84 @@ def wrap_text(c: canvas.Canvas, text: str, x: float, y: float, max_width: float,
     return y
 
 
+def _count_true(rows: Iterable[dict], key: str) -> int:
+    return sum(1 for r in rows if bool(r.get(key)) is True)
+
+
+def _nonempty(rows: Iterable[dict], key: str) -> int:
+    return sum(1 for r in rows if str(r.get(key) or "").strip() != "")
+
+
+def _classify_review_reasons(reason_text: str) -> List[str]:
+    t = (reason_text or "").lower()
+    buckets: List[str] = []
+
+    if "strict date mode" in t or "insufficient date evidence" in t:
+        buckets.append("Insufficient date evidence (strict mode)")
+    if "no potency extracted" in t:
+        buckets.append("Potency evidence missing/low confidence")
+    if "no explicit expiration date found" in t and "no label-anchored" in t:
+        buckets.append("No expiration + no analysis/test date located")
+    if "date condition not met" in t:
+        buckets.append("Date condition not met")
+    if "error:" in t:
+        buckets.append("Processing error")
+
+    return buckets or ["Other / mixed"]
+
+
+def _build_executive_summary(rows: List[Dict[str, Any]]) -> Tuple[str, str, List[str]]:
+    total = len(rows)
+    client_flagged = _count_true(rows, "flagged")
+    review_needed = _count_true(rows, "review_needed")
+    hemp_flagged = _count_true(rows, "hemp_flag")
+
+    hemp_sev = Counter((r.get("hemp_severity") or "none") for r in rows)
+    breach = hemp_sev.get("breach", 0)
+    elevated = hemp_sev.get("elevated", 0)
+    unknown = hemp_sev.get("unknown", 0)
+
+    pct_map_ok = sum(1 for r in rows if int(r.get("percent_map_count") or 0) > 0)
+    test_date_ok = _nonempty(rows, "test_date")
+    eff_exp_ok = _nonempty(rows, "effective_expiration_date")
+
+    review_reason_counts = Counter()
+    for r in rows:
+        if not bool(r.get("review_needed")):
+            continue
+        for b in _classify_review_reasons(r.get("reasons") or ""):
+            review_reason_counts[b] += 1
+
+    top_review = review_reason_counts.most_common(3)
+    top_review_txt = ", ".join(f"{k} ({v})" for k, v in top_review) if top_review else "n/a"
+
+    p1 = (
+        f"This batch scan evaluated {total} PDF COAs using an evidence-first extraction workflow designed for defensible review. "
+        f"{client_flagged} COAs ({_pct(client_flagged, total)}) met the client flag criteria, "
+        f"{hemp_flagged} COAs ({_pct(hemp_flagged, total)}) triggered federal hemp checks, and "
+        f"{review_needed} COAs ({_pct(review_needed, total)}) were marked 'review needed' due to missing or low-confidence evidence."
+    )
+
+    p2 = (
+        "Interpretation notes: 'Client flagged' indicates the COA met the rule logic "
+        "(Delta-8/Delta-9 present, THC above threshold, and an applicable date condition). "
+        "'Review needed' does not automatically mean non-compliance; it means the scanner could not obtain litigation-grade, "
+        "high-confidence evidence for one or more key fields (typically the analysis/test date or percent-column potency) "
+        "and therefore requires a human confirmation. "
+        "When an explicit expiration date is not present, the report derives an effective expiration as "
+        "'Analysis Completed' + 365 days (common cannabis practice)."
+    )
+
+    bullets = [
+        f"Potency extraction coverage: {pct_map_ok}/{total} ({_pct(pct_map_ok, total)}) had at least one usable percent-column row parsed.",
+        f"Date extraction coverage: {test_date_ok}/{total} ({_pct(test_date_ok, total)}) contained an 'Analysis Completed/Test/Analysis' date; "
+        f"{eff_exp_ok}/{total} ({_pct(eff_exp_ok, total)}) produced an effective expiration date.",
+        f"Federal hemp outcomes: breach={breach} ({_pct(breach, total)}), elevated={elevated} ({_pct(elevated, total)}), unknown={unknown} ({_pct(unknown, total)}).",
+        f"Most common 'review needed' drivers: {top_review_txt}.",
+    ]
+    return p1, p2, bullets
+
+
 def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
@@ -1030,10 +1138,6 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     review_ct = sum(1 for r in rows if r.get("review_needed") is True)
     hemp_flagged = sum(1 for r in rows if r.get("hemp_flag") is True)
 
-    hemp_breach = sum(1 for r in rows if (r.get("hemp_severity") == "breach"))
-    hemp_elevated = sum(1 for r in rows if (r.get("hemp_severity") == "elevated"))
-    hemp_unknown = sum(1 for r in rows if (r.get("hemp_severity") == "unknown"))
-
     created = utc_now_iso()
 
     c.setFont("Helvetica-Bold", 18)
@@ -1045,23 +1149,35 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
     y -= 12
     c.drawString(x, y, f"App: {APP_VERSION} | Rulesets: {RULESET_VERSION} / {FED_RULESET_VERSION}")
     y -= 12
-
     c.drawString(
         x, y,
         f"Scanned: {total} | Client-flagged: {client_flagged} ({_pct(client_flagged, total)}) | "
         f"Review-needed: {review_ct} ({_pct(review_ct, total)}) | "
         f"Hemp-flagged: {hemp_flagged} ({_pct(hemp_flagged, total)})"
     )
-    y -= 14
-
-    c.drawString(
-        x, y,
-        f"Hemp severities: breach={hemp_breach} ({_pct(hemp_breach, total)}), "
-        f"elevated={hemp_elevated} ({_pct(hemp_elevated, total)}), "
-        f"unknown={hemp_unknown} ({_pct(hemp_unknown, total)})"
-    )
     y -= 16
 
+    # Executive Summary (NEW)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x, y, "Executive Summary")
+    y -= 14
+
+    p1, p2, bullets = _build_executive_summary(rows)
+    c.setFont("Helvetica", 10)
+    y = wrap_text(c, p1, x, y, max_w, size=10, leading=13)
+    y -= 4
+    y = wrap_text(c, p2, x, y, max_w, size=10, leading=13)
+    y -= 6
+
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(x, y, "Key findings")
+    y -= 12
+    c.setFont("Helvetica", 10)
+    for b in bullets:
+        y = wrap_text(c, f"• {b}", x, y, max_w, size=10, leading=13)
+    y -= 10
+
+    # Details section
     c.setFont("Helvetica-Bold", 12)
     c.drawString(x, y, "Flagged / Review-needed (details)")
     y -= 16
@@ -1090,9 +1206,9 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
         )
 
         if r.get("test_date"):
-            y = wrap_text(c, f"Best test/analysis date: {r['test_date']}", x, y, max_w, size=9, leading=11)
+            y = wrap_text(c, f"Analysis Completed / primary date: {r['test_date']}", x, y, max_w, size=9, leading=11)
         if r.get("expiration_date"):
-            y = wrap_text(c, f"Explicit expiration date: {r['expiration_date']}", x, y, max_w, size=9, leading=11)
+            y = wrap_text(c, f"Explicit expiration: {r['expiration_date']}", x, y, max_w, size=9, leading=11)
         if r.get("effective_expiration_date"):
             y = wrap_text(c, f"Effective expiration: {r['effective_expiration_date']}", x, y, max_w, size=9, leading=11)
 
@@ -1125,38 +1241,29 @@ def generate_batch_pdf_report(rows: List[Dict[str, Any]]) -> bytes:
 
 
 # ============================
-# Scanning pipeline (adaptive deep + full fallback)
+# Scanning pipeline
 # ============================
 @dataclass(frozen=True)
 class ScanSettings:
     primary_pages: int
     deep_pages: int
     max_pages_cap: int
-
     enable_deep_scan: bool
     enable_full_fallback: bool
     relevant_page_pick: int
-
     min_text_len: int
     ocr_scale: float
-
     strict_dates_only: bool
-
     enable_hemp: bool
     hemp_delta9_limit: float
     hemp_total_limit: float
     hemp_negligent_cutoff: float
-
     scan_date_iso: str
-
-
-def _build_page_indices(primary_pages: int) -> List[int]:
-    return list(range(max(0, primary_pages)))
 
 
 def _score_pass(passd: Dict[str, Any]) -> Tuple[int, int, int]:
     ev = passd.get("evidence") or {}
-    has_date = int(bool(ev.get("expiration_evidence") or ev.get("best_test_date_evidence") or ev.get("labeled_date_evidence")))
+    has_date = int(bool(ev.get("expiration_evidence") or ev.get("best_analysis_completed_evidence") or ev.get("labeled_date_evidence")))
     conf = passd.get("confidence") or {}
     high_pot = sum(1 for c in conf.values() if c in ("high", "computed"))
     any_pot = sum(1 for v in (passd.get("potency") or {}).values() if v is not None)
@@ -1168,7 +1275,6 @@ def _run_pass(
     pdf_bytes: bytes,
     settings: ScanSettings,
     page_indices_0: List[int],
-    include_ocr_layout: bool,
 ) -> Dict[str, Any]:
     text, method, ocr_used = extract_text_hybrid(
         pdf_bytes=pdf_bytes,
@@ -1177,26 +1283,18 @@ def _run_pass(
         ocr_scale=settings.ocr_scale,
     )
 
-    # Tables from PDF (best)
     table_map, table_evs = extract_percent_map_from_tables(pdf_bytes, page_indices_0=page_indices_0)
-
-    # OCR row parsing from text (fallback)
     row_map, row_evs = extract_percent_map_from_text_rows(text)
 
-    # OCR layout parsing (best for scanned COAs)
-    layout_map: Dict[str, Dict[str, Any]] = {}
-    layout_evs: List[PotencyEvidence] = []
-    if include_ocr_layout:
-        images = render_pdf_pages_with_pdfium(pdf_bytes, page_indices_0, scale=settings.ocr_scale)
-        ocr_data = ocr_data_images(images, psm=6)
-        layout_map, layout_evs = extract_percent_map_from_ocr_layout(ocr_data)
+    images = render_pdf_pages_with_pdfium(pdf_bytes, page_indices_0, scale=settings.ocr_scale)
+    ocr_data = ocr_data_images(images, psm=6)
+    layout_map, layout_evs = extract_percent_map_from_ocr_layout(ocr_data)
 
     inline_evs = extract_inline_potency(text)
 
     percent_map = combine_percent_maps(table_map, layout_map, row_map)
     potency, conf = extract_potency_from_map(percent_map)
 
-    # Fill missing from inline explicit %
     for iev in inline_evs:
         if potency.get(iev.key) is None and iev.value_pct is not None:
             potency[iev.key] = float(iev.value_pct)
@@ -1213,7 +1311,7 @@ def _run_pass(
 
     evidence = payload["details"].get("evidence") or {}
     evidence["pages_used_0"] = page_indices_0
-    evidence["potency_evidence"] = [asdict(e) for e in (table_evs + layout_evs + row_evs + inline_evs)[:120]]
+    evidence["potency_evidence"] = [asdict(e) for e in (table_evs + layout_evs + row_evs + inline_evs)[:160]]
 
     return {
         "filename": name,
@@ -1221,13 +1319,10 @@ def _run_pass(
         "ocr_used": ocr_used,
         "pages_scanned": len(page_indices_0),
         "page_indices_0": page_indices_0,
-
         "percent_map_count": len(percent_map),
         "percent_map_source": "tables+ocr_layout+ocr_rows+inline_fill",
-
         "potency": potency,
         "confidence": conf,
-
         "flagged": bool(flagged),
         "review_needed": bool(review_needed),
         "reasons_list": payload["reasons"],
@@ -1240,40 +1335,34 @@ def scan_one_pdf(name: str, pdf_bytes: bytes, settings: ScanSettings) -> Dict[st
     created_at = utc_now_iso()
     sha = sha256_bytes(pdf_bytes)
 
-    # Page count cap
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         total_pages = len(pdf)
     cap = min(settings.max_pages_cap, total_pages)
 
-    # Pass 1: first N pages
     p1_indices = list(range(min(settings.primary_pages, cap)))
-    p1 = _run_pass(name, pdf_bytes, settings, p1_indices, include_ocr_layout=True)
-    best = p1
+    best = _run_pass(name, pdf_bytes, settings, p1_indices)
     deep_used = False
     full_used = False
 
     def needs_more(passd: Dict[str, Any]) -> bool:
         ev = passd.get("evidence") or {}
         strict_missing = any("STRICT DATE MODE: insufficient date evidence" in r for r in passd.get("reasons_list") or [])
-        date_missing = (ev.get("expiration_evidence") is None) and (not (ev.get("best_test_date_evidence") or ev.get("labeled_date_evidence")))
+        date_missing = (ev.get("expiration_evidence") is None) and (not (ev.get("best_analysis_completed_evidence") or ev.get("labeled_date_evidence")))
         potency_missing = all(v is None for v in (passd.get("potency") or {}).values())
         return strict_missing or date_missing or potency_missing
 
-    if settings.enable_deep_scan and needs_more(p1):
-        # choose relevant pages from lightweight pdf text for all pages up to cap
+    if settings.enable_deep_scan and needs_more(best):
         page_texts = extract_text_pdfplumber_pages(pdf_bytes, max_pages=cap)
         rel = choose_relevant_pages_from_text(page_texts, max_pick=min(settings.relevant_page_pick, cap))
-        # include some early pages too
         rel = sorted(set(rel + p1_indices))
-        p2 = _run_pass(name, pdf_bytes, settings, rel, include_ocr_layout=True)
+        p2 = _run_pass(name, pdf_bytes, settings, rel)
         if _score_pass(p2) > _score_pass(best):
             best = p2
             deep_used = True
 
     if settings.enable_full_fallback and needs_more(best):
-        # full fallback: scan up to deep_pages or cap
         p3_indices = list(range(min(settings.deep_pages, cap)))
-        p3 = _run_pass(name, pdf_bytes, settings, p3_indices, include_ocr_layout=True)
+        p3 = _run_pass(name, pdf_bytes, settings, p3_indices)
         if _score_pass(p3) > _score_pass(best):
             best = p3
             full_used = True
@@ -1354,15 +1443,15 @@ with st.sidebar:
     st.subheader("Scan depth (accuracy vs speed)")
     primary_pages = st.slider("Primary pages per PDF", 1, 20, 4)
     enable_deep_scan = st.toggle("Adaptive deep scan (recommended)", value=True)
-    relevant_page_pick = st.slider("Relevant pages to OCR (deep scan)", 2, 20, 8)
+    relevant_page_pick = st.slider("Relevant pages to OCR (deep scan)", 2, 20, 10)
 
     enable_full_fallback = st.toggle("Full fallback if still missing evidence", value=True)
-    deep_pages = st.slider("Full fallback pages cap", 2, 30, 12)
+    deep_pages = st.slider("Full fallback pages cap", 2, 30, 14)
     max_pages_cap = st.slider("Absolute max pages per PDF", 2, 60, 30)
 
     st.markdown("---")
     min_text_len = st.slider("OCR trigger threshold (chars)", 50, 2000, 250)
-    ocr_scale = st.slider("OCR scale (higher = slower)", 1.5, 3.5, 2.6, 0.1)
+    ocr_scale = st.slider("OCR scale (higher = slower)", 1.5, 3.5, 2.7, 0.1)
 
     st.markdown("---")
     st.subheader("Litigation controls")
@@ -1396,21 +1485,16 @@ if zip_up and run:
         primary_pages=int(primary_pages),
         deep_pages=int(deep_pages),
         max_pages_cap=int(max_pages_cap),
-
         enable_deep_scan=bool(enable_deep_scan),
         enable_full_fallback=bool(enable_full_fallback),
         relevant_page_pick=int(relevant_page_pick),
-
         min_text_len=int(min_text_len),
         ocr_scale=float(ocr_scale),
-
         strict_dates_only=bool(strict_dates_only),
-
         enable_hemp=bool(enable_hemp),
         hemp_delta9_limit=float(hemp_delta9_limit),
         hemp_total_limit=float(hemp_total_limit),
         hemp_negligent_cutoff=float(hemp_negligent_cutoff),
-
         scan_date_iso=date.today().isoformat(),
     )
 
@@ -1484,11 +1568,10 @@ if zip_up and run:
                         out_rows.append(row)
                     except Exception as e:
                         out_rows.append(make_error_row(name, record_id, created_at, e))
-
                     completed += 1
                     prog.progress(completed / total)
             else:
-                # Note: some Streamlit deployments restrict multiprocessing; keep workers=1 if issues.
+                # If your Streamlit hosting restricts multiprocessing, set Workers=1.
                 with ProcessPoolExecutor(max_workers=int(workers)) as ex:
                     futs = {ex.submit(scan_one_pdf, name, b, settings): name for name, b in items}
                     for fut in as_completed(futs):
@@ -1506,11 +1589,9 @@ if zip_up and run:
                             out_rows.append(row)
                         except Exception as e:
                             out_rows.append(make_error_row(name, record_id, created_at, e))
-
                         completed += 1
                         prog.progress(completed / total)
 
-            # DB writes
             for row in out_rows:
                 try:
                     db_insert_event(row["record_id"], "EVALUATED", {
@@ -1536,35 +1617,28 @@ if zip_up and run:
                         "source_filename": row["filename"],
                         "source_sha256": row.get("sha256", ""),
                         "source_size_bytes": row.get("size_bytes", 0),
-
                         "ruleset_version": RULESET_VERSION,
                         "fed_ruleset_version": FED_RULESET_VERSION,
                         "app_version": APP_VERSION,
-
                         "parsing_method": row.get("parsing_method", ""),
                         "max_pages_scanned": int(row.get("max_pages_scanned", 0)),
                         "ocr_used": bool(row.get("ocr_used", False)),
-
                         "flagged": bool(row.get("flagged", False)),
                         "review_needed": bool(row.get("review_needed", False)),
                         "reasons": row.get("reasons", ""),
-
                         "expiration_date": row.get("expiration_date") or None,
                         "effective_expiration_date": row.get("effective_expiration_date") or None,
                         "test_date": row.get("test_date") or None,
                         "earliest_date_found": row.get("earliest_date_found") or None,
-
                         "expired_before_cutoff": bool(row.get("expired_before_cutoff", False)),
                         "expired_as_of_scan": bool(row.get("expired_as_of_scan", False)),
                         "has_early_date": bool(row.get("has_early_date", False)),
-
                         "hemp_flag": bool(row.get("hemp_flag", False)),
                         "hemp_severity": row.get("hemp_severity", "none"),
                         "hemp_reasons": row.get("hemp_reasons", ""),
                         "hemp_delta9_pct": row.get("hemp_delta9_pct"),
                         "hemp_thca_pct": row.get("hemp_thca_pct"),
                         "hemp_total_thc_pct": row.get("hemp_total_thc_pct"),
-
                         "potency_json": json.dumps(row.get("potency") or {}, ensure_ascii=False),
                         "evidence_json": json.dumps(row.get("evidence") or {}, ensure_ascii=False),
                         "percent_map_count": int(row.get("percent_map_count", 0)),
@@ -1580,61 +1654,42 @@ if rows:
         "record_id": r["record_id"],
         "created_at_utc": r["created_at_utc"],
         "filename": r["filename"],
-
         "flagged": r["flagged"],
         "review_needed": r.get("review_needed", False),
-
         "hemp_flagged": r.get("hemp_flag", False),
         "hemp_severity": r.get("hemp_severity", ""),
-        "hemp_reasons": r.get("hemp_reasons", ""),
-
         "deep_scan_used": r.get("deep_scan_used", False),
         "full_fallback_used": r.get("full_fallback_used", False),
-
         "test_date": r.get("test_date", ""),
-        "expiration_date": r.get("expiration_date", ""),
         "effective_expiration_date": r.get("effective_expiration_date", ""),
-
-        "expired_before_cutoff": r.get("expired_before_cutoff", False),
-        "expired_as_of_scan": r.get("expired_as_of_scan", False),
-
         "pot_total_thc_pct": (r.get("potency") or {}).get("total_thc_pct"),
         "pot_delta9_pct": (r.get("potency") or {}).get("delta9_pct"),
         "pot_thca_pct": (r.get("potency") or {}).get("thca_pct"),
         "pot_delta8_pct": (r.get("potency") or {}).get("delta8_pct"),
-
         "percent_map_count": r.get("percent_map_count", 0),
         "ocr_used": r.get("ocr_used", False),
         "pages_scanned": r.get("max_pages_scanned", 0),
-
         "reasons": r.get("reasons", ""),
         "sha256": r.get("sha256", ""),
     } for r in rows])
 
     total = len(df)
-    client_flag_ct = int(df["flagged"].sum())
-    review_ct = int(df["review_needed"].sum())
-    hemp_flag_ct = int(df["hemp_flagged"].sum())
-    deep_ct = int(df["deep_scan_used"].sum())
-    full_ct = int(df["full_fallback_used"].sum())
-
     c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
     c1.metric("Total scanned", total)
-    c2.metric("Client flagged", client_flag_ct)
-    c3.metric("Review-needed", review_ct)
-    c4.metric("Hemp-flagged", hemp_flag_ct)
-    c5.metric("Deep scan used", deep_ct)
-    c6.metric("Full fallback used", full_ct)
+    c2.metric("Client flagged", int(df["flagged"].sum()))
+    c3.metric("Review-needed", int(df["review_needed"].sum()))
+    c4.metric("Hemp-flagged", int(df["hemp_flagged"].sum()))
+    c5.metric("Deep scan used", int(df["deep_scan_used"].sum()))
+    c6.metric("Full fallback used", int(df["full_fallback_used"].sum()))
 
     st.divider()
     st.subheader("Batch results")
     st.dataframe(df, use_container_width=True)
 
     st.subheader("Export")
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
     st.download_button(
         "Download CSV",
-        data=csv_bytes,
+        data=df.to_csv(index=False).encode("utf-8"),
         file_name=f"Leafline_Batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}Z.csv",
         mime="text/csv",
     )
