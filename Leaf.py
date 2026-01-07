@@ -10,6 +10,10 @@ Includes:
 - "Analysis Completed" treated as primary test date; effective expiration = (Analysis Completed + 365 days) if no explicit expiration.
 - Batch PDF report includes an Executive Summary narrative (2 paragraphs + key findings).
 
+Updates:
+- Parallel crash fix: worker processes skip Streamlit UI execution (spawn-safe).
+- ETA: live elapsed/avg/ETA shown in progress bar text when Streamlit supports it.
+
 Run:
   streamlit run app.py
 """
@@ -23,6 +27,8 @@ import zipfile
 import hashlib
 import sqlite3
 import multiprocessing as mp
+import time
+import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime, date, timezone, timedelta
 from collections import Counter
@@ -42,11 +48,6 @@ from pytesseract import Output
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
-
-try:
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    pass
 
 
 # ============================
@@ -756,7 +757,6 @@ def _parse_percent_token(tok: str) -> Tuple[Optional[float], str]:
     if t.endswith("%"):
         t = t[:-1].strip()
 
-    # strip common OCR trailing junk (keeps digits, '.', '<')
     t = re.sub(r"[^\d\.<]+$", "", t).strip()
 
     if _ND_RE.fullmatch(t) or _ND_RE.search(t):
@@ -822,7 +822,6 @@ def extract_percent_map_from_ocr_layout(
         return xs
 
     def find_header_anchors(lines: List[List[dict]]) -> Optional[Dict[str, float]]:
-        # Primary: both LOQ and Percent on same line
         for i, ws in enumerate(lines[:70]):
             s = _norm(line_text(ws))
             if not (("loq" in s) and (("percent" in s) or ("%" in s))):
@@ -836,7 +835,6 @@ def extract_percent_map_from_ocr_layout(
             x_pct = float(sorted(pct_right)[len(pct_right) // 2]) if pct_right else float(sorted(pct_xs)[len(pct_xs) // 2])
             return {"header_idx": float(i), "x_loq": x_loq, "x_pct": x_pct}
 
-        # Fallback: LOQ and Percent on adjacent/near lines
         loq_candidates: List[Tuple[int, float]] = []
         pct_candidates: List[Tuple[int, float]] = []
         for i, ws in enumerate(lines[:80]):
@@ -857,7 +855,6 @@ def extract_percent_map_from_ocr_layout(
                     header_idx = float(min(i_loq, i_pct))
                     x_pct = x_pct0
                     if x_pct <= x_loq + 10:
-                        # If OCR order is weird, nudge percent anchor right using tokens on that percent line
                         ws = lines[i_pct]
                         xs = _xs_for(ws, r"%|percent")
                         if xs:
@@ -1472,7 +1469,6 @@ def _run_pass(
     settings: ScanSettings,
     page_indices_0: List[int],
 ) -> Dict[str, Any]:
-    # Text extraction: pdfplumber -> hybrid OCR -> OCR-only fallback
     try:
         text, method, ocr_used = extract_text_hybrid(
             pdf_bytes=pdf_bytes,
@@ -1486,7 +1482,6 @@ def _run_pass(
         o2 = ocr_text_images(images_txt, psm=11)
         text, method, ocr_used = (o1 + "\n\n" + o2).strip(), "ocr_only_fallback", True
 
-    # Table extraction: if it fails, continue with OCR layout + rows
     try:
         table_map, table_evs = extract_percent_map_from_tables(pdf_bytes, page_indices_0=page_indices_0)
     except Exception:
@@ -1496,7 +1491,6 @@ def _run_pass(
 
     images = render_pdf_pages_with_pdfium(pdf_bytes, page_indices_0, scale=settings.ocr_scale)
 
-    # Dual OCR pass (normal + inverted), cropped to likely table region
     ocr_data_norm = ocr_data_images_mode(images, psm=6, mode="thresh")
     ocr_data_inv = ocr_data_images_mode(images, psm=6, mode="invthresh")
 
@@ -1664,156 +1658,204 @@ def scan_one_pdf(name: str, pdf_bytes: bytes, settings: ScanSettings) -> Dict[st
 
 
 # ============================
-# Streamlit UI
+# Parallel safety + ETA helpers
 # ============================
-st.set_page_config(page_title=f"{APP_NAME} — Batch COA Scanner", layout="wide")
-init_db()
+WORKER_ENV_KEY = "LEAFLINE_WORKER_PROCESS"
 
-st.title(APP_NAME)
-st.caption("Upload a ZIP of PDFs. Leafline scans each file, flags inconsistencies, and exports evidence for audit/litigation.")
 
-with st.sidebar:
-    st.subheader("Scan depth (accuracy vs speed)")
-    primary_pages = st.slider("Primary pages per PDF", 1, 20, 4)
-    enable_deep_scan = st.toggle("Adaptive deep scan (recommended)", value=True)
-    relevant_page_pick = st.slider("Relevant pages to OCR (deep scan)", 2, 20, 10)
+def _is_worker_process() -> bool:
+    return os.environ.get(WORKER_ENV_KEY, "0") == "1"
 
-    enable_full_fallback = st.toggle("Full fallback if still missing evidence", value=True)
-    deep_pages = st.slider("Full fallback pages cap", 2, 30, 14)
-    max_pages_cap = st.slider("Absolute max pages per PDF", 2, 60, 30)
 
-    st.markdown("---")
-    min_text_len = st.slider("OCR trigger threshold (chars)", 50, 2000, 250)
-    ocr_scale = st.slider("OCR scale (higher = slower)", 1.5, 3.5, 2.7, 0.1)
+def _format_exc(e: BaseException) -> str:
+    return "".join(traceback.format_exception(type(e), e, e.__traceback__))[-4000:]
 
-    st.markdown("---")
-    st.subheader("Litigation controls")
-    strict_dates_only = st.toggle("STRICT: require explicit expiration or label-anchored dates", value=True)
 
-    st.markdown("---")
-    st.subheader("Parallel processing")
-    workers = st.number_input("Workers", 1, max(1, (os.cpu_count() or 2)), 1, 1)
+def _fmt_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "—"
+    s = max(0, int(seconds + 0.5))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
-    st.markdown("---")
-    st.subheader("Federal hemp checks")
-    enable_hemp = st.toggle("Enable federal hemp checks", value=True)
-    hemp_delta9_limit = st.number_input("Delta-9 THC limit (%)", value=float(HEMP_DELTA9_LIMIT), step=0.1, format="%.3f")
-    hemp_total_limit = st.number_input("Total THC limit (%)", value=float(HEMP_TOTAL_LIMIT), step=0.1, format="%.3f")
-    hemp_negligent_cutoff = st.number_input("Negligence threshold (%)", value=float(HEMP_TOTAL_NEGLIGENT_CUTOFF), step=0.1, format="%.3f")
 
-    st.markdown("---")
-    reviewer = st.text_input("Reviewer (optional)", value="")
+def _batch_timing(total: int, completed: int, batch_start: float) -> Dict[str, Optional[float]]:
+    now = time.perf_counter()
+    elapsed = now - batch_start
+    if completed <= 0:
+        return {"elapsed": elapsed, "sec_per_pdf": None, "eta": None}
+    sec_per_pdf = elapsed / float(completed)
+    remaining = max(0, total - completed)
+    eta = sec_per_pdf * remaining
+    return {"elapsed": elapsed, "sec_per_pdf": sec_per_pdf, "eta": eta}
 
-zip_up = st.file_uploader("Upload ZIP of PDFs", type=["zip"])
-run = st.button("Run batch scan", type="primary", disabled=(zip_up is None))
 
-if "batch_rows" not in st.session_state:
-    st.session_state["batch_rows"] = []
+# ============================
+# Streamlit UI (main process only)
+# ============================
+def run_app() -> None:
+    st.set_page_config(page_title=f"{APP_NAME} — Batch COA Scanner", layout="wide")
+    init_db()
 
-if zip_up and run:
-    zbytes = zip_up.read()
-    out_rows: List[Dict[str, Any]] = []
+    st.title(APP_NAME)
+    st.caption("Upload a ZIP of PDFs. Leafline scans each file, flags inconsistencies, and exports evidence for audit/litigation.")
 
-    settings = ScanSettings(
-        primary_pages=int(primary_pages),
-        deep_pages=int(deep_pages),
-        max_pages_cap=int(max_pages_cap),
-        enable_deep_scan=bool(enable_deep_scan),
-        enable_full_fallback=bool(enable_full_fallback),
-        relevant_page_pick=int(relevant_page_pick),
-        min_text_len=int(min_text_len),
-        ocr_scale=float(ocr_scale),
-        strict_dates_only=bool(strict_dates_only),
-        enable_hemp=bool(enable_hemp),
-        hemp_delta9_limit=float(hemp_delta9_limit),
-        hemp_total_limit=float(hemp_total_limit),
-        hemp_negligent_cutoff=float(hemp_negligent_cutoff),
-        scan_date_iso=date.today().isoformat(),
-    )
+    with st.sidebar:
+        st.subheader("Scan depth (accuracy vs speed)")
+        primary_pages = st.slider("Primary pages per PDF", 1, 20, 4)
+        enable_deep_scan = st.toggle("Adaptive deep scan (recommended)", value=True)
+        relevant_page_pick = st.slider("Relevant pages to OCR (deep scan)", 2, 20, 10)
 
-    prog = st.progress(0.0)
-    status = st.empty()
+        enable_full_fallback = st.toggle("Full fallback if still missing evidence", value=True)
+        deep_pages = st.slider("Full fallback pages cap", 2, 30, 14)
+        max_pages_cap = st.slider("Absolute max pages per PDF", 2, 60, 30)
 
-    with zipfile.ZipFile(io.BytesIO(zbytes), "r") as z:
-        names = [n for n in z.namelist() if n.lower().endswith(SUPPORTED_EXTS) and not n.endswith("/")]
-        total = len(names)
+        st.markdown("---")
+        min_text_len = st.slider("OCR trigger threshold (chars)", 50, 2000, 250)
+        ocr_scale = st.slider("OCR scale (higher = slower)", 1.5, 3.5, 2.7, 0.1)
 
-        if total == 0:
-            st.error("No PDFs found in the ZIP.")
-        else:
-            items = [(n, z.read(n)) for n in names]
-            completed = 0
+        st.markdown("---")
+        st.subheader("Litigation controls")
+        strict_dates_only = st.toggle("STRICT: require explicit expiration or label-anchored dates", value=True)
 
-            def make_error_row(name_: str, record_id_: str, created_at_: str, err: Exception) -> Dict[str, Any]:
-                return {
-                    "record_id": record_id_,
-                    "created_at_utc": created_at_,
-                    "filename": name_,
-                    "sha256": "",
-                    "size_bytes": 0,
-                    "parsing_method": "error",
-                    "ocr_used": False,
-                    "max_pages_scanned": settings.primary_pages,
-                    "deep_scan_used": False,
-                    "full_fallback_used": False,
-                    "flagged": False,
-                    "review_needed": True,
-                    "reasons": f"ERROR: {err}",
-                    "test_date": "",
-                    "expiration_date": "",
-                    "effective_expiration_date": "",
-                    "earliest_date_found": "",
-                    "expired_before_cutoff": False,
-                    "expired_as_of_scan": False,
-                    "has_early_date": False,
-                    "strict_dates_only": settings.strict_dates_only,
-                    "used_labeled_dates": False,
-                    "has_delta8": False,
-                    "has_delta9": False,
-                    "hemp_flag": False,
-                    "hemp_severity": "none",
-                    "hemp_reasons": "",
-                    "hemp_delta9_pct": None,
-                    "hemp_thca_pct": None,
-                    "hemp_total_thc_pct": None,
-                    "potency": {},
-                    "confidence": {},
-                    "percent_map_count": 0,
-                    "percent_map_source": "none",
-                    "evidence": {"error": str(err)},
-                    "ruleset_version": RULESET_VERSION,
-                    "fed_ruleset_version": FED_RULESET_VERSION,
-                    "app_version": APP_VERSION,
-                }
+        st.markdown("---")
+        st.subheader("Parallel processing")
+        workers = st.number_input("Workers", 1, max(1, (os.cpu_count() or 2)), 1, 1)
 
-            if int(workers) == 1:
-                for name, b in items:
-                    status.write(f"Scanning {completed + 1}/{total}: {name}")
-                    record_id = str(uuid.uuid4())
-                    created_at = utc_now_iso()
-                    try:
-                        row = scan_one_pdf(name, b, settings)
-                        row["record_id"] = record_id
-                        row["created_at_utc"] = created_at
-                        row["ruleset_version"] = RULESET_VERSION
-                        row["fed_ruleset_version"] = FED_RULESET_VERSION
-                        row["app_version"] = APP_VERSION
-                        out_rows.append(row)
-                    except Exception as e:
-                        out_rows.append(make_error_row(name, record_id, created_at, e))
-                    completed += 1
-                    prog.progress(completed / total)
+        st.markdown("---")
+        st.subheader("Federal hemp checks")
+        enable_hemp = st.toggle("Enable federal hemp checks", value=True)
+        hemp_delta9_limit = st.number_input("Delta-9 THC limit (%)", value=float(HEMP_DELTA9_LIMIT), step=0.1, format="%.3f")
+        hemp_total_limit = st.number_input("Total THC limit (%)", value=float(HEMP_TOTAL_LIMIT), step=0.1, format="%.3f")
+        hemp_negligent_cutoff = st.number_input("Negligence threshold (%)", value=float(HEMP_TOTAL_NEGLIGENT_CUTOFF), step=0.1, format="%.3f")
+
+        st.markdown("---")
+        reviewer = st.text_input("Reviewer (optional)", value="")
+
+    zip_up = st.file_uploader("Upload ZIP of PDFs", type=["zip"])
+    run = st.button("Run batch scan", type="primary", disabled=(zip_up is None))
+
+    if "batch_rows" not in st.session_state:
+        st.session_state["batch_rows"] = []
+
+    if zip_up and run:
+        zbytes = zip_up.read()
+        out_rows: List[Dict[str, Any]] = []
+
+        settings = ScanSettings(
+            primary_pages=int(primary_pages),
+            deep_pages=int(deep_pages),
+            max_pages_cap=int(max_pages_cap),
+            enable_deep_scan=bool(enable_deep_scan),
+            enable_full_fallback=bool(enable_full_fallback),
+            relevant_page_pick=int(relevant_page_pick),
+            min_text_len=int(min_text_len),
+            ocr_scale=float(ocr_scale),
+            strict_dates_only=bool(strict_dates_only),
+            enable_hemp=bool(enable_hemp),
+            hemp_delta9_limit=float(hemp_delta9_limit),
+            hemp_total_limit=float(hemp_total_limit),
+            hemp_negligent_cutoff=float(hemp_negligent_cutoff),
+            scan_date_iso=date.today().isoformat(),
+        )
+
+        prog = st.progress(0.0)
+        status = st.empty()
+        batch_start = time.perf_counter()
+
+        progress_text_fallback = st.empty()
+        supports_progress_text = True
+
+        def _set_progress(frac: float, text: str) -> None:
+            nonlocal supports_progress_text
+            if supports_progress_text:
+                try:
+                    prog.progress(frac, text=text)
+                    return
+                except TypeError:
+                    supports_progress_text = False
+                except Exception:
+                    supports_progress_text = False
+            prog.progress(frac)
+            progress_text_fallback.caption(text)
+
+        def make_error_row(name_: str, record_id_: str, created_at_: str, err: Exception) -> Dict[str, Any]:
+            return {
+                "record_id": record_id_,
+                "created_at_utc": created_at_,
+                "filename": name_,
+                "sha256": "",
+                "size_bytes": 0,
+                "parsing_method": "error",
+                "ocr_used": False,
+                "max_pages_scanned": settings.primary_pages,
+                "deep_scan_used": False,
+                "full_fallback_used": False,
+                "flagged": False,
+                "review_needed": True,
+                "reasons": f"ERROR: {err}",
+                "test_date": "",
+                "expiration_date": "",
+                "effective_expiration_date": "",
+                "earliest_date_found": "",
+                "expired_before_cutoff": False,
+                "expired_as_of_scan": False,
+                "has_early_date": False,
+                "strict_dates_only": settings.strict_dates_only,
+                "used_labeled_dates": False,
+                "has_delta8": False,
+                "has_delta9": False,
+                "hemp_flag": False,
+                "hemp_severity": "none",
+                "hemp_reasons": "",
+                "hemp_delta9_pct": None,
+                "hemp_thca_pct": None,
+                "hemp_total_thc_pct": None,
+                "potency": {},
+                "confidence": {},
+                "percent_map_count": 0,
+                "percent_map_source": "none",
+                "evidence": {"error": str(err), "traceback": _format_exc(err)},
+                "ruleset_version": RULESET_VERSION,
+                "fed_ruleset_version": FED_RULESET_VERSION,
+                "app_version": APP_VERSION,
+            }
+
+        with zipfile.ZipFile(io.BytesIO(zbytes), "r") as z:
+            names = [n for n in z.namelist() if n.lower().endswith(SUPPORTED_EXTS) and not n.endswith("/")]
+            total = len(names)
+
+            if total == 0:
+                st.error("No PDFs found in the ZIP.")
             else:
-                # If your Streamlit hosting restricts multiprocessing, set Workers=1.
-                with ProcessPoolExecutor(max_workers=int(workers)) as ex:
-                    futs = {ex.submit(scan_one_pdf, name, b, settings): name for name, b in items}
-                    for fut in as_completed(futs):
-                        name = futs[fut]
+                items = [(n, z.read(n)) for n in names]
+                completed = 0
+                _set_progress(0.0, "Starting batch…")
+
+                def _progress_text(cur_name: str) -> str:
+                    t = _batch_timing(total, completed, batch_start)
+                    return (
+                        f"{completed}/{total} done | "
+                        f"Elapsed {_fmt_duration(t['elapsed'])} | "
+                        f"Avg {_fmt_duration(t['sec_per_pdf'])}/pdf | "
+                        f"ETA {_fmt_duration(t['eta'])} | "
+                        f"Now: {cur_name}"
+                    )
+
+                if int(workers) == 1:
+                    for name, b in items:
+                        status.write(f"Scanning {completed + 1}/{total}: {name}")
+                        _set_progress(completed / total, _progress_text(name))
+
                         record_id = str(uuid.uuid4())
                         created_at = utc_now_iso()
-                        status.write(f"Completed {completed + 1}/{total}: {name}")
                         try:
-                            row = fut.result()
+                            row = scan_one_pdf(name, b, settings)
                             row["record_id"] = record_id
                             row["created_at_utc"] = created_at
                             row["ruleset_version"] = RULESET_VERSION
@@ -1822,135 +1864,176 @@ if zip_up and run:
                             out_rows.append(row)
                         except Exception as e:
                             out_rows.append(make_error_row(name, record_id, created_at, e))
+
                         completed += 1
-                        prog.progress(completed / total)
+                        _set_progress(completed / total, _progress_text(name))
 
-            for row in out_rows:
-                try:
-                    db_insert_event(row["record_id"], "EVALUATED", {
-                        "filename": row["filename"],
-                        "sha256": row.get("sha256"),
-                        "parsing_method": row.get("parsing_method"),
-                        "ocr_used": row.get("ocr_used"),
-                        "flagged": row.get("flagged"),
-                        "review_needed": row.get("review_needed"),
-                        "reasons": row.get("reasons"),
-                        "potency": row.get("potency"),
-                        "confidence": row.get("confidence"),
-                        "evidence": row.get("evidence"),
-                        "ruleset_version": RULESET_VERSION,
-                        "fed_ruleset_version": FED_RULESET_VERSION,
-                        "app_version": APP_VERSION,
-                    })
+                else:
+                    prior = os.environ.get(WORKER_ENV_KEY)
+                    os.environ[WORKER_ENV_KEY] = "1"
+                    try:
+                        ctx = mp.get_context("spawn")
+                        with ProcessPoolExecutor(max_workers=int(workers), mp_context=ctx) as ex:
+                            futs = {ex.submit(scan_one_pdf, name, b, settings): name for name, b in items}
 
-                    db_insert_record({
-                        "record_id": row["record_id"],
-                        "created_at_utc": row["created_at_utc"],
-                        "reviewer": reviewer or None,
-                        "source_filename": row["filename"],
-                        "source_sha256": row.get("sha256", ""),
-                        "source_size_bytes": row.get("size_bytes", 0),
-                        "ruleset_version": RULESET_VERSION,
-                        "fed_ruleset_version": FED_RULESET_VERSION,
-                        "app_version": APP_VERSION,
-                        "parsing_method": row.get("parsing_method", ""),
-                        "max_pages_scanned": int(row.get("max_pages_scanned", 0)),
-                        "ocr_used": bool(row.get("ocr_used", False)),
-                        "flagged": bool(row.get("flagged", False)),
-                        "review_needed": bool(row.get("review_needed", False)),
-                        "reasons": row.get("reasons", ""),
-                        "expiration_date": row.get("expiration_date") or None,
-                        "effective_expiration_date": row.get("effective_expiration_date") or None,
-                        "test_date": row.get("test_date") or None,
-                        "earliest_date_found": row.get("earliest_date_found") or None,
-                        "expired_before_cutoff": bool(row.get("expired_before_cutoff", False)),
-                        "expired_as_of_scan": bool(row.get("expired_as_of_scan", False)),
-                        "has_early_date": bool(row.get("has_early_date", False)),
-                        "hemp_flag": bool(row.get("hemp_flag", False)),
-                        "hemp_severity": row.get("hemp_severity", "none"),
-                        "hemp_reasons": row.get("hemp_reasons", ""),
-                        "hemp_delta9_pct": row.get("hemp_delta9_pct"),
-                        "hemp_thca_pct": row.get("hemp_thca_pct"),
-                        "hemp_total_thc_pct": row.get("hemp_total_thc_pct"),
-                        "potency_json": json.dumps(row.get("potency") or {}, ensure_ascii=False),
-                        "evidence_json": json.dumps(row.get("evidence") or {}, ensure_ascii=False),
-                        "percent_map_count": int(row.get("percent_map_count", 0)),
-                    })
-                except Exception as e:
-                    db_insert_event(row["record_id"], "DB_ERROR", {"filename": row["filename"], "error": str(e)})
+                            for fut in as_completed(futs):
+                                name = futs[fut]
+                                status.write(f"Completed {completed + 1}/{total}: {name}")
+                                _set_progress(completed / total, _progress_text(name))
 
-    st.session_state["batch_rows"] = out_rows
+                                record_id = str(uuid.uuid4())
+                                created_at = utc_now_iso()
+                                try:
+                                    row = fut.result()
+                                    row["record_id"] = record_id
+                                    row["created_at_utc"] = created_at
+                                    row["ruleset_version"] = RULESET_VERSION
+                                    row["fed_ruleset_version"] = FED_RULESET_VERSION
+                                    row["app_version"] = APP_VERSION
+                                    out_rows.append(row)
+                                except Exception as e:
+                                    out_rows.append(make_error_row(name, record_id, created_at, e))
 
-rows = st.session_state.get("batch_rows", [])
-if rows:
-    df = pd.DataFrame([{
-        "record_id": r["record_id"],
-        "created_at_utc": r["created_at_utc"],
-        "filename": r["filename"],
-        "flagged": r["flagged"],
-        "review_needed": r.get("review_needed", False),
-        "hemp_flagged": r.get("hemp_flag", False),
-        "hemp_severity": r.get("hemp_severity", ""),
-        "deep_scan_used": r.get("deep_scan_used", False),
-        "full_fallback_used": r.get("full_fallback_used", False),
-        "test_date": r.get("test_date", ""),
-        "effective_expiration_date": r.get("effective_expiration_date", ""),
-        "pot_total_thc_pct": (r.get("potency") or {}).get("total_thc_pct"),
-        "pot_delta9_pct": (r.get("potency") or {}).get("delta9_pct"),
-        "pot_thca_pct": (r.get("potency") or {}).get("thca_pct"),
-        "pot_delta8_pct": (r.get("potency") or {}).get("delta8_pct"),
-        "percent_map_count": r.get("percent_map_count", 0),
-        "ocr_used": r.get("ocr_used", False),
-        "pages_scanned": r.get("max_pages_scanned", 0),
-        "reasons": r.get("reasons", ""),
-        "sha256": r.get("sha256", ""),
-    } for r in rows])
+                                completed += 1
+                                _set_progress(completed / total, _progress_text(name))
+                    finally:
+                        if prior is None:
+                            os.environ.pop(WORKER_ENV_KEY, None)
+                        else:
+                            os.environ[WORKER_ENV_KEY] = prior
 
-    total = len(df)
-    c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
-    c1.metric("Total scanned", total)
-    c2.metric("Client flagged", int(df["flagged"].sum()))
-    c3.metric("Review-needed", int(df["review_needed"].sum()))
-    c4.metric("Hemp-flagged", int(df["hemp_flagged"].sum()))
-    c5.metric("Deep scan used", int(df["deep_scan_used"].sum()))
-    c6.metric("Full fallback used", int(df["full_fallback_used"].sum()))
+                for row in out_rows:
+                    try:
+                        db_insert_event(row["record_id"], "EVALUATED", {
+                            "filename": row["filename"],
+                            "sha256": row.get("sha256"),
+                            "parsing_method": row.get("parsing_method"),
+                            "ocr_used": row.get("ocr_used"),
+                            "flagged": row.get("flagged"),
+                            "review_needed": row.get("review_needed"),
+                            "reasons": row.get("reasons"),
+                            "potency": row.get("potency"),
+                            "confidence": row.get("confidence"),
+                            "evidence": row.get("evidence"),
+                            "ruleset_version": RULESET_VERSION,
+                            "fed_ruleset_version": FED_RULESET_VERSION,
+                            "app_version": APP_VERSION,
+                        })
 
-    st.divider()
-    st.subheader("Batch results")
-    st.dataframe(df, use_container_width=True)
+                        db_insert_record({
+                            "record_id": row["record_id"],
+                            "created_at_utc": row["created_at_utc"],
+                            "reviewer": reviewer or None,
+                            "source_filename": row["filename"],
+                            "source_sha256": row.get("sha256", ""),
+                            "source_size_bytes": row.get("size_bytes", 0),
+                            "ruleset_version": RULESET_VERSION,
+                            "fed_ruleset_version": FED_RULESET_VERSION,
+                            "app_version": APP_VERSION,
+                            "parsing_method": row.get("parsing_method", ""),
+                            "max_pages_scanned": int(row.get("max_pages_scanned", 0)),
+                            "ocr_used": bool(row.get("ocr_used", False)),
+                            "flagged": bool(row.get("flagged", False)),
+                            "review_needed": bool(row.get("review_needed", False)),
+                            "reasons": row.get("reasons", ""),
+                            "expiration_date": row.get("expiration_date") or None,
+                            "effective_expiration_date": row.get("effective_expiration_date") or None,
+                            "test_date": row.get("test_date") or None,
+                            "earliest_date_found": row.get("earliest_date_found") or None,
+                            "expired_before_cutoff": bool(row.get("expired_before_cutoff", False)),
+                            "expired_as_of_scan": bool(row.get("expired_as_of_scan", False)),
+                            "has_early_date": bool(row.get("has_early_date", False)),
+                            "hemp_flag": bool(row.get("hemp_flag", False)),
+                            "hemp_severity": row.get("hemp_severity", "none"),
+                            "hemp_reasons": row.get("hemp_reasons", ""),
+                            "hemp_delta9_pct": row.get("hemp_delta9_pct"),
+                            "hemp_thca_pct": row.get("hemp_thca_pct"),
+                            "hemp_total_thc_pct": row.get("hemp_total_thc_pct"),
+                            "potency_json": json.dumps(row.get("potency") or {}, ensure_ascii=False),
+                            "evidence_json": json.dumps(row.get("evidence") or {}, ensure_ascii=False),
+                            "percent_map_count": int(row.get("percent_map_count", 0)),
+                        })
+                    except Exception as e:
+                        db_insert_event(row["record_id"], "DB_ERROR", {"filename": row["filename"], "error": str(e), "traceback": _format_exc(e)})
 
-    st.subheader("Export")
-    st.download_button(
-        "Download CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"Leafline_Batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}Z.csv",
-        mime="text/csv",
-    )
+        st.session_state["batch_rows"] = out_rows
+        t_done = _batch_timing(total, total, batch_start)
+        _set_progress(1.0, f"Done | Elapsed {_fmt_duration(t_done['elapsed'])} | Avg {_fmt_duration(t_done['sec_per_pdf'])}/pdf")
 
-    batch_pdf = generate_batch_pdf_report(rows)
-    st.download_button(
-        "Download Batch PDF Report",
-        data=batch_pdf,
-        file_name=f"Leafline_Batch_Report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}Z.pdf",
-        mime="application/pdf",
-    )
+    rows = st.session_state.get("batch_rows", [])
+    if rows:
+        df = pd.DataFrame([{
+            "record_id": r["record_id"],
+            "created_at_utc": r["created_at_utc"],
+            "filename": r["filename"],
+            "flagged": r["flagged"],
+            "review_needed": r.get("review_needed", False),
+            "hemp_flagged": r.get("hemp_flag", False),
+            "hemp_severity": r.get("hemp_severity", ""),
+            "deep_scan_used": r.get("deep_scan_used", False),
+            "full_fallback_used": r.get("full_fallback_used", False),
+            "test_date": r.get("test_date", ""),
+            "effective_expiration_date": r.get("effective_expiration_date", ""),
+            "pot_total_thc_pct": (r.get("potency") or {}).get("total_thc_pct"),
+            "pot_delta9_pct": (r.get("potency") or {}).get("delta9_pct"),
+            "pot_thca_pct": (r.get("potency") or {}).get("thca_pct"),
+            "pot_delta8_pct": (r.get("potency") or {}).get("delta8_pct"),
+            "percent_map_count": r.get("percent_map_count", 0),
+            "ocr_used": r.get("ocr_used", False),
+            "pages_scanned": r.get("max_pages_scanned", 0),
+            "reasons": r.get("reasons", ""),
+            "sha256": r.get("sha256", ""),
+        } for r in rows])
 
-    evidence_bundle = [{
-        "record_id": r["record_id"],
-        "filename": r["filename"],
-        "sha256": r.get("sha256"),
-        "flagged": r.get("flagged"),
-        "review_needed": r.get("review_needed"),
-        "reasons": r.get("reasons"),
-        "potency": r.get("potency"),
-        "confidence": r.get("confidence"),
-        "evidence": r.get("evidence"),
-    } for r in rows]
-    st.download_button(
-        "Download Evidence Bundle (JSON)",
-        data=json.dumps(evidence_bundle, ensure_ascii=False, indent=2).encode("utf-8"),
-        file_name=f"Leafline_Evidence_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}Z.json",
-        mime="application/json",
-    )
-else:
-    st.info("Upload a ZIP of PDFs to run a batch scan.")
+        total = len(df)
+        c1, c2, c3, c4, c5, c6 = st.columns([1, 1, 1, 1, 1, 1])
+        c1.metric("Total scanned", total)
+        c2.metric("Client flagged", int(df["flagged"].sum()))
+        c3.metric("Review-needed", int(df["review_needed"].sum()))
+        c4.metric("Hemp-flagged", int(df["hemp_flagged"].sum()))
+        c5.metric("Deep scan used", int(df["deep_scan_used"].sum()))
+        c6.metric("Full fallback used", int(df["full_fallback_used"].sum()))
+
+        st.divider()
+        st.subheader("Batch results")
+        st.dataframe(df, use_container_width=True)
+
+        st.subheader("Export")
+        st.download_button(
+            "Download CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name=f"Leafline_Batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}Z.csv",
+            mime="text/csv",
+        )
+
+        batch_pdf = generate_batch_pdf_report(rows)
+        st.download_button(
+            "Download Batch PDF Report",
+            data=batch_pdf,
+            file_name=f"Leafline_Batch_Report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}Z.pdf",
+            mime="application/pdf",
+        )
+
+        evidence_bundle = [{
+            "record_id": r["record_id"],
+            "filename": r["filename"],
+            "sha256": r.get("sha256"),
+            "flagged": r.get("flagged"),
+            "review_needed": r.get("review_needed"),
+            "reasons": r.get("reasons"),
+            "potency": r.get("potency"),
+            "confidence": r.get("confidence"),
+            "evidence": r.get("evidence"),
+        } for r in rows]
+        st.download_button(
+            "Download Evidence Bundle (JSON)",
+            data=json.dumps(evidence_bundle, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"Leafline_Evidence_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}Z.json",
+            mime="application/json",
+        )
+    else:
+        st.info("Upload a ZIP of PDFs to run a batch scan.")
+
+
+if not _is_worker_process():
+    run_app()
