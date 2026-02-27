@@ -561,6 +561,10 @@ _HAS_PERCENT = re.compile(r"%")
 _HAS_MG_G = re.compile(r"\bmg\s*/?\s*g\b|\bmg\s+g\b", re.IGNORECASE)
 _HAS_MG_KG = re.compile(r"\bmg\s*/?\s*kg\b", re.IGNORECASE)
 _HAS_PPM = re.compile(r"\bppm\b", re.IGNORECASE)
+# Unit-aware token patterns: match a number immediately followed by its unit
+_PCT_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_MG_G_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:mg\s*/?\s*g\b|mg\s+g\b)", re.IGNORECASE)
+_LT_LOQ_RE = re.compile(r"<\s*loq\b", re.IGNORECASE)
 
 DECARB_FORMULA_RE = re.compile(
     r"0\.877\s*(?:x|\*)\s*thc\s*[-\s]*a|0\.877\s*(?:x|\*)\s*thca|max\s*thc|decarb|decarbox|calculation|formula|factor",
@@ -618,10 +622,30 @@ def _normalize_to_percent(raw: float, line: str) -> Tuple[Optional[float], str, 
 
 
 def _extract_row_value(line: str) -> Tuple[Optional[float], str, str, str]:
+    # Unit-aware: prefer explicit %-tagged token over mg/g-tagged token.
+    pct_match = _PCT_TOKEN_RE.search(line)
+    if pct_match:
+        raw = float(pct_match.group(1))
+        pct, conf, notes = _normalize_to_percent(raw, "%")
+        return pct, conf, notes, str(raw)
+
+    mg_g_match = _MG_G_NUM_RE.search(line)
+    if mg_g_match:
+        raw = float(mg_g_match.group(1))
+        pct, conf, notes = _normalize_to_percent(raw, "mg/g")
+        return pct, conf, notes, str(raw)
+
+    # ND / <LOQ checks come AFTER unit-tagged number checks intentionally: when a line
+    # contains both "<LOQ" and a numeric value with a unit (e.g., "<LOQ 0.1 mg/g"),
+    # the explicit unit-tagged number takes precedence over the <LOQ sentinel.
+    # These checks only fire when NO unit-tagged number was found on the line.
+    if _ND_RE.search(line):
+        return 0.0, "medium", "nd_detected", "ND"
+    if _LT_LOQ_RE.search(line):
+        return 0.0, "medium", "lt_loq", "<LOQ"
+
     nums = [float(x) for x in _NUM_RE.findall(line)]
     if not nums:
-        if _ND_RE.search(line):
-            return 0.0, ("high" if _HAS_PERCENT.search(line) else "medium"), "nd_no_numbers", "ND"
         return None, "none", "no_numbers", ""
     raw = nums[1] if len(nums) >= 2 else nums[0]
     pct, conf, notes = _normalize_to_percent(raw, line)
@@ -689,7 +713,7 @@ def extract_percent_map_from_tables(pdf_bytes: bytes, page_indices_0: List[int])
                     if loq_idx is not None and loq_idx < len(row):
                         loq_val = _parse_float_or_nd(row[loq_idx])
 
-                    pct, conf, notes = _normalize_to_percent(float(raw_val), row_join)
+                    pct, conf, notes = _normalize_to_percent_raw_from_header(float(raw_val))
                     evs.append(PotencyEvidence(
                         key=key, value_pct=pct, source="table", confidence=conf, page=page_idx,
                         raw_name=raw_name[:120], raw_value=str(raw_val_cell)[:80],
@@ -1093,23 +1117,19 @@ def evaluate_federal_hemp_from_potency(
     reasons: List[str] = []
     severity = "none"
 
-    if d9 is not None and float(d9) > delta9_limit:
+    # Delta-9 is the sole primary compliance metric for federal hemp.
+    if d9 is None:
+        reasons.append("Delta-9 THC not found; federal hemp compliance cannot be determined")
+        severity = "unknown"
+    elif float(d9) > delta9_limit:
         reasons.append(f"Delta-9 THC exceeds {delta9_limit}% (delta-9 = {float(d9):.3f}%)")
         severity = "breach"
 
-    if total is not None and float(total) > total_limit:
-        reasons.append(f"Total THC exceeds {total_limit}% (total = {float(total):.3f}%)")
-        severity = "breach"
+    # Report total THC as informational (does not affect severity or flag).
+    if total is not None:
+        reasons.append(f"Total THC: {float(total):.3f}% (informational)")
 
-    if total is not None and float(total) > negligent_cutoff:
-        reasons.append(f"Total THC exceeds {negligent_cutoff}% (total = {float(total):.3f}%)")
-        severity = "elevated"
-
-    if d9 is None and total is None:
-        reasons.append("No reliable Delta-9/Total THC % found")
-        severity = "unknown"
-
-    return severity in ("breach", "elevated"), {
+    return severity == "breach", {
         "reasons": reasons,
         "severity": severity,
         "delta9_pct": d9,
