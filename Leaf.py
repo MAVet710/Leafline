@@ -18,6 +18,7 @@ Run:
   streamlit run app.py
 """
 
+import base64
 import io
 import os
 import re
@@ -57,6 +58,7 @@ APP_NAME = "Leafline"
 APP_VERSION = "3.6.4"
 DB_PATH = "leafline_audit.db"
 SUPPORTED_EXTS = (".pdf",)
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "leafline-logo.png")
 
 # ============================
 # Client-required flag logic
@@ -1718,8 +1720,63 @@ def _batch_timing(total: int, completed: int, batch_start: float) -> Dict[str, O
 # ============================
 # Streamlit UI (main process only)
 # ============================
+def _get_logo_image() -> Optional[Image.Image]:
+    """Load the Leafline logo from the assets directory, or return None if missing."""
+    if os.path.exists(LOGO_PATH):
+        return Image.open(LOGO_PATH)
+    return None
+
+
+def _logo_as_base64() -> Optional[str]:
+    """Return the Leafline logo as a base64-encoded PNG data URI, or None."""
+    if not os.path.exists(LOGO_PATH):
+        return None
+    with open(LOGO_PATH, "rb") as f:
+        data = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:image/png;base64,{data}"
+
+
 def run_app() -> None:
-    st.set_page_config(page_title=f"{APP_NAME} — Batch COA Scanner", layout="wide")
+    logo_img = _get_logo_image()
+    st.set_page_config(
+        page_title=f"{APP_NAME} — Batch COA Scanner",
+        page_icon=logo_img,
+        layout="wide",
+    )
+
+    # Inject watermark CSS using the logo as a fixed, centered, low-opacity background.
+    logo_uri = _logo_as_base64()
+    if logo_uri:
+        bg_css = f"""
+        <style>
+        /* Watermark: logo centered, fixed, low opacity */
+        .stApp::before {{
+            content: "";
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: url("{logo_uri}");
+            background-repeat: no-repeat;
+            background-position: center center;
+            background-size: 340px 340px;
+            background-attachment: fixed;
+            opacity: 0.07;
+            pointer-events: none;
+            z-index: 0;
+        }}
+        /* Ensure main content sits above the watermark layer */
+        .main .block-container {{
+            position: relative;
+            z-index: 1;
+            background-color: rgba(255, 255, 255, 0.88);
+            border-radius: 8px;
+        }}
+        </style>
+        """
+        st.markdown(bg_css, unsafe_allow_html=True)
+
     init_db()
 
     st.title(APP_NAME)
