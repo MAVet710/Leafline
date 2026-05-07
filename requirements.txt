@@ -6,3 +6,6 @@ reportlab
 pytesseract
 pypdfium2
 Pillow
+
+openpyxl
+pytest
